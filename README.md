@@ -1,18 +1,58 @@
 # RifeClaw
 
-A Bun-powered TypeScript CLI for working with a codebase through local CLI modes
-and an optional Telegram bot.
+RifeClaw is a Bun-powered TypeScript CLI that helps you explore and modify a local codebase with AI through guided local modes and an optional Telegram interface.
+
+It supports:
+- **OpenRouter** (cloud models)
+- **Ollama** (local/offline model runtime)
+- Optional **Firecrawl** tools for web search/crawl
+- Optional **Telegram** bot workflows for remote interaction
+
+> **Safety first:** file/folder/shell mutations are staged first and require explicit approval before they are applied.
+
+## Table of Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Modes](#modes)
+- [Safety Model](#safety-model)
+- [Verification & Troubleshooting](#verification--troubleshooting)
+- [Development](#development)
+- [Example App](#example-app)
+- [Contributing](#contributing)
+
+## Features
+
+- Guided setup: `rifeclaw setup` creates/updates `.env` using interactive prompts.
+- Health checks: `rifeclaw doctor` validates readiness and prints next steps.
+- Interactive launcher: `rifeclaw` (no subcommand) opens the wakeup mode picker.
+- CLI workflows:
+  - **Ask Mode** (read-only codebase Q&A)
+  - **Plan Mode** (structured plan + selectable execution)
+  - **Agent Mode** (multi-step coding actions staged for approval)
+- Optional Telegram workflows (`/ask`, `/plan`, `/agent`) for owner-only bot access.
+- Works in the current directory or an explicit target via `--project <path>`.
 
 ## Requirements
 
-- Bun
-- OpenRouter API key, or Ollama running locally for offline model use
-- Optional: Firecrawl API key for web search/crawl tools
-- Optional: Telegram bot token and owner chat ID for Telegram mode
+- **Node.js 18+** (for installed CLI usage via npm/npx)
+- **Bun** (for local development in this repository)
+- One AI provider configured:
+  - **OpenRouter API key**, or
+  - **Ollama** installed/running locally
+- Optional integrations:
+  - **Firecrawl API key** (web search/crawl tools)
+  - **Telegram bot token + owner ID** (Telegram mode)
 
-## Quick Start
+## Installation
 
-Install RifeClaw in the project you want to work on:
+### Option A: Install per project (recommended)
+
+From the project you want to work on:
 
 ```bash
 npm install --save-dev rifeclaw
@@ -21,7 +61,7 @@ npx rifeclaw doctor
 npx rifeclaw
 ```
 
-Or install it globally once and run it from inside any project:
+### Option B: Global install
 
 ```bash
 npm install -g rifeclaw
@@ -31,7 +71,7 @@ rifeclaw doctor
 rifeclaw
 ```
 
-Or point the tool at a project from anywhere:
+### Option C: Point at another project
 
 ```bash
 rifeclaw --project ../my-project setup
@@ -39,51 +79,35 @@ rifeclaw --project ../my-project doctor
 rifeclaw --project ../my-project
 ```
 
-In both cases, Ask, Plan, Agent, and Telegram mode operate on `my-project`.
+## Quick Start
 
-`setup` creates or updates `.env` with guided prompts. `doctor` checks whether
-the project is ready before the user starts a mode.
+1. Run `rifeclaw setup` and choose your provider (OpenRouter or Ollama).
+2. Run `rifeclaw doctor` to verify configuration.
+3. Run `rifeclaw` and choose:
+   - **CLI** → Agent / Plan / Ask sub-modes
+   - **Telegram** → bot workflows (if configured)
 
-## Development
+## Configuration
 
-For local development of this tool:
-
-```bash
-bun install
-bun run setup
-bun run doctor
-bun run dev
-```
-
-To test the installable command from this source checkout:
-
-```bash
-npm link
-rifeclaw doctor --project .
-```
-
-To inspect the exact npm package contents before publishing:
-
-```bash
-npm pack --dry-run
-```
-
-## Environment
-
-The easiest option is:
+Use guided setup first:
 
 ```bash
 rifeclaw setup
 ```
 
-You can also copy `.env.example` to `.env` and fill in the values manually:
+This creates or updates `.env` in the target project.
+
+### Environment variables
 
 ```bash
+# AI provider: openrouter or ollama
 AI_PROVIDER=openrouter
+
+# OpenRouter settings
 OPENROUTER_API_KEY=your_openrouter_key
 OPENROUTER_DEFAULT_MODEL=openai/gpt-4.1
 
-# Local offline option
+# Ollama local settings
 # AI_PROVIDER=ollama
 OLLAMA_MODEL=qwen2.5-coder:7b
 OLLAMA_BASE_URL=http://localhost:11434/v1
@@ -96,42 +120,132 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_OWNER_ID=your_numeric_chat_id
 ```
 
-For local offline use, install Ollama, keep Ollama running, and set
-`AI_PROVIDER=ollama`. During `rifeclaw setup`, RifeClaw detects installed
-Ollama models, estimates your system RAM, suggests a model that should fit,
-lets you pick from common local models, and also lets you enter any Ollama
-model tag manually. It can run `ollama pull <model>` for the selected model.
-Firecrawl web tools and OpenRouter still require internet access.
+### Ollama notes
+
+When you choose Ollama during `setup`, RifeClaw can:
+- detect installed local models,
+- estimate system RAM and suggest a fitting model,
+- let you pick a known model or enter any model tag,
+- optionally run `ollama pull <model>`.
 
 ## Commands
 
 ```bash
+rifeclaw
+rifeclaw wakeup
 rifeclaw setup
 rifeclaw doctor
-rifeclaw
 ```
 
-- `setup`: guided `.env` creation for required and optional integrations.
-- `doctor`: setup health check with clear next steps.
-- Running `rifeclaw` with no subcommand starts the interactive mode picker.
+- `rifeclaw` (no subcommand): starts wakeup picker.
+- `wakeup`: explicitly open the same wakeup picker.
+- `setup`: guided `.env` creation/update.
+- `doctor`: readiness checks for provider and optional integrations.
 
-All commands accept `--project <path>` when the target codebase is not the
-current directory.
+All commands support:
+
+```bash
+--project <path>
+```
+
+Use it when the target codebase is not the current directory.
 
 ## Modes
 
-- `Agent Mode`: lets the agent inspect and stage code changes for approval.
-- `Plan Mode`: generates a plan, lets you choose steps, then stages changes for approval.
-- `Ask Mode`: answers questions about the codebase without modifying files.
-- `Telegram`: exposes ask, agent, and plan workflows through a Telegram bot.
+### Main picker
+
+- **Command Line Interface (CLI)**
+- **Telegram Assistant**
+- **Exit**
+
+### CLI sub-modes
+
+- **Agent Mode**: proposes code/file/shell mutations and stages them for approval.
+- **Plan Mode**: creates a stepwise plan, lets you select steps, then stages results for approval.
+- **Ask Mode**: read-only questions about the codebase.
+
+### Telegram mode (optional)
+
+After configuring Telegram credentials, you can use:
+- `/ask`
+- `/plan`
+- `/agent`
+- `/help`
+- `/start`
 
 ## Safety Model
 
-File, folder, and shell mutations are staged first. The CLI shows an approval
-flow before applying them. Shell execution is additionally blocked for several
-high-risk destructive commands and has a timeout.
+RifeClaw is designed for controlled local automation:
+
+- File and folder mutations are **staged first**.
+- Shell actions are **queued/staged first**.
+- You must explicitly approve staged actions before they are applied.
+- High-risk destructive shell patterns are blocked (for example force-delete patterns and dangerous git cleanup/reset operations).
+- Shell execution is time-limited.
+
+## Verification & Troubleshooting
+
+### Verify setup
+
+```bash
+rifeclaw doctor
+```
+
+If not ready, follow the printed hints and re-run `rifeclaw setup`.
+
+### Common checks
+
+- **Missing `.env` or keys**: run `rifeclaw setup` again.
+- **Ollama issues**: ensure Ollama is running and model/base URL are correct.
+- **Telegram not responding**:
+  - verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_OWNER_ID`,
+  - confirm you are messaging the configured owner account.
+- **Working on another repository**: pass `--project <path>`.
+
+## Development
+
+For local development of this tool:
+
+```bash
+bun install
+bun run setup
+bun run doctor
+bun run dev
+```
+
+Useful validation commands:
+
+```bash
+bun run test
+bun run typecheck
+bun run build
+```
+
+Test the installable command from this source checkout:
+
+```bash
+npm link
+rifeclaw doctor --project .
+```
+
+Inspect package contents before publishing:
+
+```bash
+npm pack --dry-run
+```
 
 ## Example App
 
-`todo-list-app` is a small browser-only todo demo. Open
-`todo-list-app/index.html` in a browser to try it.
+A small browser-only demo lives in `todo-list-app/`.
+
+Open `todo-list-app/index.html` in your browser to try it.
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+For best results before opening a PR:
+- run `bun run test`
+- run `bun run typecheck`
+- run `bun run build`
+- verify setup behavior with `bun run setup` and `bun run doctor`
