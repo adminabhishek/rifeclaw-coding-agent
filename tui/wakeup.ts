@@ -34,21 +34,30 @@ export async function runWakeup() {
         ascii = figlet.textSync("RifeClaw" , {font:"Standard"})
     }
 
-    printBannerWithShadow(ascii)
+    printBannerWithShadow(ascii);
+
+    // Add spacing and context
+    console.log();
+    console.log(SHADOW(chalk.grey("Choose your preferred interface:")));
+    console.log();
 
     const mode = await select({
-        message:"Which mode you want to proceed with?",
+        message: "Type a number or arrow keys:\n\n[1] 💻 Command Line Interface (CLI)\n[2] 📌 Telegram Assistant\n[3] 🚪 Exit",
         options:[
-            {value:"cli" , label:"CLI"},
-            {value:"telegram" , label:"Telegram"},
-            {value:"exit" , label:"Exit"}
+            {value:"cli" , label:"💻 Command Line Interface (CLI)"},
+            {value:"telegram" , label:"📌 Telegram Assistant"},
+            {value:"exit" , label:"🚪 Exit"}
         ]
     });
 
     if(isCancel(mode) || mode === "exit"){
-        console.log(chalk.dim('\n Goodbye. \n'));
+        console.log(chalk.yellow('\\n Dont worry! Just run `rifeclaw` again.'));
         return;
     }
+
+    // Optional: Add a loading message before switching modes
+    console.log('\\nLoading your choice...');
+    console.log();
 
     if(mode === "cli"){
         await runCliMode()

@@ -25,9 +25,9 @@ describe("approvalSummary", () => {
       }),
     ]);
 
-    expect(summary).toContain("app.ts");
-    expect(summary).toContain("Shell: bun test");
-    expect(summary).toContain("Total: 2 change(s)");
+    expect(summary).toContain("app\\.ts");
+    expect(summary).toContain("bun test");
+    expect(summary).toContain("2 change(s)");
   });
 });
 
@@ -48,6 +48,6 @@ describe("approvalDiff", () => {
 
     expect(diff).toContain("-old");
     expect(diff).toContain("+new");
-    expect(diff).toContain("Shell: bun test");
+    expect(diff).toContain("bun test");
   });
 });

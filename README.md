@@ -6,7 +6,7 @@ and an optional Telegram bot.
 ## Requirements
 
 - Bun
-- OpenRouter API key
+- OpenRouter API key, or Ollama running locally for offline model use
 - Optional: Firecrawl API key for web search/crawl tools
 - Optional: Telegram bot token and owner chat ID for Telegram mode
 
@@ -79,8 +79,14 @@ rifeclaw setup
 You can also copy `.env.example` to `.env` and fill in the values manually:
 
 ```bash
+AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_openrouter_key
 OPENROUTER_DEFAULT_MODEL=openai/gpt-4.1
+
+# Local offline option
+# AI_PROVIDER=ollama
+OLLAMA_MODEL=qwen2.5-coder:7b
+OLLAMA_BASE_URL=http://localhost:11434/v1
 
 # Optional web tools
 FIRECRAWL_API_KEY=your_firecrawl_key
@@ -89,6 +95,13 @@ FIRECRAWL_API_KEY=your_firecrawl_key
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_OWNER_ID=your_numeric_chat_id
 ```
+
+For local offline use, install Ollama, keep Ollama running, and set
+`AI_PROVIDER=ollama`. During `rifeclaw setup`, RifeClaw detects installed
+Ollama models, estimates your system RAM, suggests a model that should fit,
+lets you pick from common local models, and also lets you enter any Ollama
+model tag manually. It can run `ollama pull <model>` for the selected model.
+Firecrawl web tools and OpenRouter still require internet access.
 
 ## Commands
 

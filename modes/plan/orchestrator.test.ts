@@ -17,6 +17,21 @@ const steps: PlanStep[] = [
   },
 ];
 
+// Helper: build a stream-mock agent that emits a single chunk of text.
+function makeStreamAgent(onPrompt: (p: string) => void, text: string | null | undefined) {
+  return {
+    stream: async ({ prompt }: { prompt: string }) => {
+      onPrompt(prompt);
+      return {
+        textStream: (async function* () {
+          if (text != null) yield text;
+        })(),
+        text: Promise.resolve(text ?? ""),
+      };
+    },
+  };
+}
+
 describe("stepPrompt", () => {
   test("includes the goal, step title, and description", () => {
     expect(stepPrompt("Improve app", steps[0]!)).toBe(
@@ -34,12 +49,10 @@ describe("executePlanSteps", () => {
     let clears = 0;
 
     await executePlanSteps("Improve app", steps, {
-      createStepAgent: () => ({
-        generate: async ({ prompt }) => {
-          prompts.push(prompt);
-          return { text: `done ${prompts.length}` };
-        },
-      }),
+      createStepAgent: () =>
+        makeStreamAgent((p) => {
+          prompts.push(p);
+        }, `done ${prompts.length}`),
       approve: async () => {
         approvals++;
         return true;
@@ -63,8 +76,8 @@ describe("executePlanSteps", () => {
     expect(approvals).toBe(1);
     expect(applies).toBe(1);
     expect(clears).toBe(1);
+    expect(printed).toContain("rendered:done 0");
     expect(printed).toContain("rendered:done 1");
-    expect(printed).toContain("rendered:done 2");
   });
 
   test("clears staging and skips apply when approval is rejected", async () => {
@@ -72,9 +85,7 @@ describe("executePlanSteps", () => {
     let clears = 0;
 
     await executePlanSteps("Improve app", [steps[0]!], {
-      createStepAgent: () => ({
-        generate: async () => ({ text: null }),
-      }),
+      createStepAgent: () => makeStreamAgent(() => {}, null),
       approve: async () => false,
       applyApproved: () => {
         applies++;
@@ -96,9 +107,7 @@ describe("executePlanSteps", () => {
     const errors: string[] = [];
 
     await executePlanSteps("Improve app", [steps[0]!], {
-      createStepAgent: () => ({
-        generate: async () => ({ text: undefined }),
-      }),
+      createStepAgent: () => makeStreamAgent(() => {}, undefined),
       approve: async () => true,
       applyApproved: () => ({ errors: ["failed write"] }),
       clearStaging: () => {},

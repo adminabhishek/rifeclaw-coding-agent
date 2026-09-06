@@ -1,4 +1,5 @@
 import {
+  NoObjectGeneratedError,
   Output,
   extractJsonMiddleware,
   generateText,
@@ -6,6 +7,7 @@ import {
   tool,
   wrapLanguageModel,
 } from "ai";
+import type { LanguageModelV3 } from "@ai-sdk/provider";
 import { z } from "zod";
 import chalk from "chalk";
 import { getAgentModel } from "../../ai/ai.config.ts";
@@ -100,19 +102,37 @@ const PLAN_INSTRUCTIONS = (codebase: string, hasWeb: boolean) =>
     hasWeb
       ? "Web tools are available (web_search/web_crawl/fetch_url). Use only when needed."
       : "Web tools are unavailable (no FIRECRAWL_API_KEY).",
-    "Output must match the provided JSON schema.",
+    "",
+    "CRITICAL: You must respond with ONLY valid JSON matching the schema.",
+    "Do NOT include any explanatory text, markdown formatting, or code fences.",
+    "Do NOT write prose, analysis, or commentary before or after the JSON.",
+    "Your response must start with `{` and end with `}`.",
+    "No prose. No markdown. Just raw JSON.",
+    "",
+    "Required JSON shape:",
+    "{",
+    '  "researchSummary": "optional brief summary string",',
+    '  "steps": [',
+    "    {",
+    '      "title": "step title (string)",',
+    '      "description": "step description (string)",',
+    '      "hints": ["optional", "hints", "array"],',
+    '      "complexity": "low" | "medium" | "high"',
+    "    }",
+    "  ]",
+    "}",
+    "",
     "Keep it short: 1–15 steps.",
   ].join("\n");
 
-export async function generatePlan(goal: string) {
+export async function generatePlan(goal: string, priorContext?: string) {
   const config = defaultAgentConfig();
   const tracker = new ActionTracker();
   const executor = new ToolExecutor(tracker, config);
 
-
   const hasWeb = hasWebTools();
   const model = wrapLanguageModel({
-    model:getAgentModel(),
+    model:getAgentModel() as LanguageModelV3,
     middleware:extractJsonMiddleware()
   })
 
@@ -121,14 +141,62 @@ export async function generatePlan(goal: string) {
 
   console.log(chalk.cyan("\n🔍 Researching & drafting a plan…\n"));
 
-  const result = await generateText({
-    model,
-    tools,
-    stopWhen:stepCountIs(20),
-    system:PLAN_INSTRUCTIONS(config.codebasePath , hasWeb),
-    prompt:`User goal: \n${goal}`,
-    output:Output.object({schema:planSchema})
-  });
+  const basePrompt = priorContext
+    ? `Previous conversation in this project:\n${priorContext}\n\n---\n\nCurrent user goal:\n${goal}`
+    : `User goal: \n${goal}`;
+
+  let result;
+  try {
+    result = await generateText({
+      model,
+      tools,
+      stopWhen: stepCountIs(20),
+      system: PLAN_INSTRUCTIONS(config.codebasePath, hasWeb),
+      prompt: basePrompt,
+      output: Output.object({ schema: planSchema }),
+    });
+  } catch (firstError) {
+    if (!NoObjectGeneratedError.isInstance(firstError)) throw firstError;
+
+    // First attempt produced non-JSON. Retry once with a strict reminder.
+    console.log(chalk.yellow("\n⚠️  Model returned non-JSON. Retrying with strict JSON reminder…\n"));
+
+    const retrySystem = [
+      PLAN_INSTRUCTIONS(config.codebasePath, hasWeb),
+      "",
+      "STRICT REMINDER: Your previous response was not valid JSON.",
+      "Reply with ONLY the JSON object. No prose, no markdown, no code fences.",
+      "The first character of your response must be `{` and the last must be `}`.",
+    ].join("\n");
+
+    try {
+      result = await generateText({
+        model,
+        tools,
+        stopWhen: stepCountIs(20),
+        system: retrySystem,
+        prompt: basePrompt,
+        output: Output.object({ schema: planSchema }),
+      });
+    } catch {
+      // Retry also failed. Fall back to a single-step plan.
+      console.log(chalk.red("\n❌ Model failed to produce valid JSON after retry."));
+      console.log(chalk.dim("   Returning a fallback single-step plan.\n"));
+
+      return {
+        goal,
+        researchSummary: `Plan generation failed. Model may not support structured output.`,
+        steps: [
+          {
+            id: "step-1",
+            title: "Manual planning required",
+            description: `The goal "${goal}" could not be auto-planned. Try rephrasing, or switch to Ask Mode for guidance first.`,
+            complexity: "medium" as const,
+          },
+        ],
+      };
+    }
+  }
 
   const validated = planSchema.parse(result.output);
 

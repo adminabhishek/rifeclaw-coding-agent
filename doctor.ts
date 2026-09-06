@@ -23,6 +23,10 @@ function hasEnv(name: string, values: Map<string, string>): boolean {
   return Boolean(process.env[name]?.trim() || values.get(name)?.trim());
 }
 
+function envValue(name: string, values: Map<string, string>): string {
+  return process.env[name]?.trim() || values.get(name)?.trim() || "";
+}
+
 function status(ok: boolean, label: string, help?: string): void {
   const mark = ok ? chalk.green("OK") : chalk.yellow("--");
   console.log(`${mark} ${label}`);
@@ -33,22 +37,51 @@ export function runDoctor(projectPath = getProjectPath()): void {
   console.log(chalk.bold("\nRifeClaw doctor\n"));
   console.log(chalk.dim(`Project: ${projectPath}\n`));
 
-  status(Boolean(Bun.version), `Bun ${Bun.version}`);
+  // Runtime detection — works under Bun, Node, and any other JS runtime.
+  const bunVersion = (globalThis as { Bun?: { version: string } }).Bun?.version;
+  if (bunVersion) {
+    status(true, `Bun ${bunVersion}`);
+  } else {
+    const nodeVersion = process.versions.node;
+    status(true, `Node.js ${nodeVersion}`);
+  }
 
   const envExists = fs.existsSync(path.join(projectPath, ".env"));
   const envValues = readEnvFile(projectPath);
   status(envExists, ".env file found", "Run `rifeclaw setup` to create one.");
 
+  const aiProvider = (envValue("AI_PROVIDER", envValues) || "openrouter").toLowerCase();
+  const usesOllama = aiProvider === "ollama";
+  const usesOpenRouter = aiProvider === "openrouter";
+
   status(
-    hasEnv("OPENROUTER_API_KEY", envValues),
-    "OpenRouter API key configured",
-    "Add OPENROUTER_API_KEY to .env.",
+    usesOpenRouter || usesOllama,
+    `AI provider configured (${aiProvider})`,
+    "Add AI_PROVIDER=openrouter or AI_PROVIDER=ollama to .env.",
   );
-  status(
-    hasEnv("OPENROUTER_DEFAULT_MODEL", envValues),
-    "Default model configured",
-    "Add OPENROUTER_DEFAULT_MODEL=openai/gpt-4.1 to .env.",
-  );
+
+  if (usesOllama) {
+    status(
+      hasEnv("OLLAMA_MODEL", envValues),
+      "Ollama model configured",
+      "Run `rifeclaw setup` to choose an Ollama model for this machine.",
+    );
+    status(
+      true,
+      `Ollama base URL: ${envValue("OLLAMA_BASE_URL", envValues) || "http://localhost:11434/v1"}`,
+    );
+  } else {
+    status(
+      hasEnv("OPENROUTER_API_KEY", envValues),
+      "OpenRouter API key configured",
+      "Add OPENROUTER_API_KEY to .env.",
+    );
+    status(
+      hasEnv("OPENROUTER_DEFAULT_MODEL", envValues),
+      "Default OpenRouter model configured",
+      "Add OPENROUTER_DEFAULT_MODEL=openai/gpt-4.1 to .env.",
+    );
+  }
 
   status(
     hasEnv("FIRECRAWL_API_KEY", envValues),
@@ -65,8 +98,11 @@ export function runDoctor(projectPath = getProjectPath()): void {
   );
 
   const readyForCli =
-    hasEnv("OPENROUTER_API_KEY", envValues) &&
-    hasEnv("OPENROUTER_DEFAULT_MODEL", envValues);
+    (usesOpenRouter &&
+      hasEnv("OPENROUTER_API_KEY", envValues) &&
+      hasEnv("OPENROUTER_DEFAULT_MODEL", envValues)) ||
+    (usesOllama &&
+      hasEnv("OLLAMA_MODEL", envValues));
   console.log();
   if (readyForCli) {
     console.log(chalk.green("Ready for CLI Ask, Agent, and Plan modes."));

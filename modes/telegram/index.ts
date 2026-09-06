@@ -1,6 +1,6 @@
 import { Telegraf } from "telegraf";
 import chalk from "chalk";
-import { WELCOME } from "./constants";
+import { buildWelcomeMessage } from "./help";
 import { registerHandlers } from "./handlers";
 import { requireEnv } from "../../env.ts";
 
@@ -62,7 +62,7 @@ export async function runTelegramMode() {
   });
 
   try {
-    await bot.telegram.sendMessage(ownerId, WELCOME, { parse_mode: "Markdown" });
+    await bot.telegram.sendMessage(ownerId, buildWelcomeMessage(), { parse_mode: "MarkdownV2" });
   } catch (error) {
     console.error(chalk.red("Could not send Telegram welcome message:"), getSafeErrorDetails(error));
     return;

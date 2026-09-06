@@ -17,8 +17,10 @@ export function printMissingEnvHelp(error: MissingEnvError): void {
 
   if (error.variableName.startsWith("TELEGRAM_")) {
     console.error(chalk.dim("Telegram mode needs TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID."));
+  } else if (error.variableName.startsWith("OLLAMA_")) {
+    console.error(chalk.dim("Local Ollama mode needs AI_PROVIDER=ollama and OLLAMA_MODEL."));
   } else if (error.variableName.startsWith("OPENROUTER_")) {
-    console.error(chalk.dim("CLI Ask, Agent, and Plan modes need OPENROUTER_API_KEY and OPENROUTER_DEFAULT_MODEL."));
+    console.error(chalk.dim("OpenRouter mode needs OPENROUTER_API_KEY and OPENROUTER_DEFAULT_MODEL."));
   }
 
   console.error();
@@ -30,4 +32,8 @@ export function requireEnv(name: string): string {
     throw new MissingEnvError(name);
   }
   return value;
+}
+
+export function optionalEnv(name: string): string | undefined {
+  return process.env[name]?.trim() || undefined;
 }
