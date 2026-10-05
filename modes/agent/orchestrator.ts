@@ -1,4 +1,4 @@
-import { isCancel, text } from "@clack/prompts";
+import { isCancel, select, text } from "@clack/prompts";
 import chalk from "chalk";
 import { defaultAgentConfig } from "./types";
 import { ActionTracker } from "./action-tracker";
@@ -6,11 +6,14 @@ import { ToolExecutor } from "./tool-executor";
 import { createAgentTools } from "./agent-tools";
 import { stepCountIs, ToolLoopAgent } from "ai";
 import { getAgentModel, formatStructuredOutput } from "../../ai/ai.config";
+import { RifeClawError } from "../../src/errors/error-system.ts";
 import { memoryManager } from "../../src/ai/memory";
 import { renderTerminalMarkdown } from "../../tui/terminal-md";
 import { runApprovalFlow } from "./approval";
+import { createLiveTokenUsageReporter } from "../../src/utils/live-token-usage.ts";
+import { createReasoningDropdown } from "../../tui/reasoning-dropdown";
 
-export async function runAgentMode() {
+export async function runAgentMode(): Promise<boolean> {
   console.log(chalk.bold("\n🤖 Agent Mode\n"));
   console.log(chalk.cyan("🔍 Ready to receive a task. Type /back to return.\n"));
 
@@ -19,10 +22,10 @@ export async function runAgentMode() {
     placeholder: "Concrete task for this codebase...",
   });
 
-  if (isCancel(goal) || !goal.trim()) return;
+  if (isCancel(goal) || !goal.trim()) return true;
 
   const trimmedGoal = goal.trim();
-  if (trimmedGoal.toLowerCase() === "/back") return;
+  if (trimmedGoal.toLowerCase() === "/back") return false;
 
   // Load memory from disk so we have access to previous sessions
   memoryManager.loadFromDisk();
@@ -49,14 +52,18 @@ export async function runAgentMode() {
 
   const tracker = new ActionTracker();
   const executor = new ToolExecutor(tracker, config);
-  const tools = createAgentTools(executor);
-
-  console.log(chalk.cyan("⚡ Processing tool calls...\n"));
+  const preview = (value: unknown) => {
+    const text = typeof value === "string" ? value : JSON.stringify(value);
+    return (text ?? "").replace(/\s+/g, " ").slice(0, 140);
+  };
+  const tools = createAgentTools(executor, {
+    onToolStart: (name, input) => console.log(chalk.yellow("  →"), chalk.bold(name), chalk.dim(preview(input))),
+    onToolFinish: (name, result) => console.log(chalk.green("  ✓"), chalk.bold(name), chalk.dim(preview(result))),
+  });
 
   // Build the effective prompt: prepend prior conversation context if available
-  const priorMessages = memoryManager.getRecentContext(sessionId);
-  const effectivePrompt = priorMessages
-    ? `${priorMessages}\n\n---\n\nCurrent request:\n${trimmedGoal}`
+  const effectivePrompt = priorContext
+    ? `${priorContext}\n\n---\n\nCurrent request:\n${trimmedGoal}`
     : trimmedGoal;
 
   const agent = new ToolLoopAgent({
@@ -65,7 +72,7 @@ export async function runAgentMode() {
     instructions: [
       `Workspace root: ${config.codebasePath}`,
       "All mutations are staged until approval.",
-      priorMessages
+      priorContext
         ? "You have a conversation history below. Consider previous requests and responses when answering."
         : "This is the start of a fresh conversation.",
       "Provide clear, structured responses with confidence levels.",
@@ -73,31 +80,46 @@ export async function runAgentMode() {
     tools,
   });
 
+  const reportTokenUsage = createLiveTokenUsageReporter();
   const result = await agent.stream({
     prompt: effectivePrompt,
-    onStepFinish: ({ toolCalls }) => {
-      for (const tc of toolCalls) {
-        const preview = JSON.stringify(tc.input).slice(0, 160);
-        console.log(chalk.green("  ✓"), chalk.bold(String(tc.toolName)), chalk.dim(preview + (preview.length >= 160 ? "..." : "")));
-      }
-    },
+    onStepFinish: ({ usage }) => reportTokenUsage(usage),
   });
 
-  // Stream output line-by-line so the user sees the agent think in real time.
-  // Buffer chunks and flush on each newline to avoid half-line updates.
-  let buffer = "";
+  // Capture reasoning separately from text output
+  const reasoningDropdown = createReasoningDropdown();
+
+  // Render complete Markdown blocks from the full stream.
+  // Separate text-delta parts (rendered as markdown) from reasoning-delta parts
+  // (accumulated for the reasoning dropdown).
+  let textBuffer = "";
   let lineCount = 0;
-  for await (const chunk of result.textStream) {
-    buffer += chunk;
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      console.log(renderTerminalMarkdown(line));
-      lineCount++;
+  for await (const part of result.fullStream) {
+    if (part.type === "text-delta") {
+      textBuffer += part.text;
+      let boundary = textBuffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = textBuffer.slice(0, boundary);
+        if (((block.match(/```/g) ?? []).length % 2) === 1) {
+          const next = textBuffer.indexOf("\n\n", boundary + 2);
+          if (next < 0) break;
+          boundary = next;
+          continue;
+        }
+        if (block.trim()) {
+          console.log(renderTerminalMarkdown(block));
+          lineCount++;
+        }
+        textBuffer = textBuffer.slice(boundary + 2);
+        boundary = textBuffer.indexOf("\n\n");
+      }
+    } else if (part.type === "reasoning-delta") {
+      reasoningDropdown.append(part.text);
     }
   }
-  if (buffer.trim().length > 0) {
-    console.log(renderTerminalMarkdown(buffer));
+  // Flush any remaining buffered text
+  if (textBuffer.trim().length > 0) {
+    console.log(renderTerminalMarkdown(textBuffer));
     lineCount++;
   }
 
@@ -113,13 +135,54 @@ export async function runAgentMode() {
     console.log(renderTerminalMarkdown(formatted.data.answer), "\n");
   }
 
-  console.log(chalk.cyan("🔧 Changes are ready for approval...\n"));
+  // Always show the panel control so users can tell whether reasoning arrived.
+  let collapsed = true;
+  if (reasoningDropdown.hasContent()) {
+    console.log("\n" + reasoningDropdown.render());
+  } else {
+    console.log(chalk.dim("\nNo reasoning tokens were returned for this response."));
+  }
+
+  while (true) {
+    const hasReasoning = reasoningDropdown.hasContent();
+    const action = await select({
+      message: "Internal reasoning (use ↑/↓ and Enter)",
+      options: [
+        ...(hasReasoning
+          ? [{ value: "toggle", label: collapsed ? "Show reasoning" : "Hide reasoning" }]
+          : [{ value: "info", label: "Why is no reasoning shown?" }]),
+        { value: "continue", label: "Continue" },
+      ],
+    });
+    if (isCancel(action) || action === "continue") break;
+    if (hasReasoning) {
+      reasoningDropdown.toggle();
+      collapsed = !collapsed;
+      console.log("\n" + reasoningDropdown.render());
+    } else {
+      console.log(chalk.dim(
+        "No reasoning was emitted. Enable OPENROUTER_REASONING_ENABLED and use an OpenRouter model that supports reasoning.\n",
+      ));
+    }
+  }
+
+  if (tracker.getPendingMutations().length === 0) {
+    console.log(chalk.green("\n✅ Task complete. No file changes were needed.\n"));
+    memoryManager.updateTask(taskId, { status: 'completed', result: 'Completed without file changes' });
+    memoryManager.saveToDisk();
+    executor.clearStaging();
+    return true;
+  }
+
+  console.log(chalk.cyan("🔧 Changes are staged. Review them before applying.\n"));
 
   const ok = await runApprovalFlow(tracker);
   if (!ok) {
     console.log(chalk.yellow("\n✋ Changes rejected. Nothing was applied.\n"));
     memoryManager.updateTask(taskId, { status: 'failed', result: 'Rejected by user' });
-    return executor.clearStaging();
+    memoryManager.saveToDisk();
+    executor.clearStaging();
+    return true;
   }
 
   const { errors } = executor.applyApprovedFromTracker();
@@ -137,4 +200,5 @@ export async function runAgentMode() {
   memoryManager.saveToDisk();
 
   executor.clearStaging();
+  return true;
 }

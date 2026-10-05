@@ -33,6 +33,11 @@ export function loadProjectEnv(root = projectPath): void {
     const [, key, rawValue] = match;
     if (!key || rawValue === undefined || process.env[key]) continue;
 
-    process.env[key] = rawValue.trim();
+    const value = rawValue.trim();
+    const quote = value[0];
+    process.env[key] =
+      (quote === "'" || quote === '"') && value.at(-1) === quote
+        ? value.slice(1, -1)
+        : value;
   }
 }

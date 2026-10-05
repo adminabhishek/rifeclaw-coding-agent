@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { clip, commandArg } from "./text.ts";
+import { clip, commandArg, isSimpleGreeting } from "./text.ts";
 
 describe("commandArg", () => {
   test("extracts text after a slash command", () => {
@@ -14,6 +14,14 @@ describe("commandArg", () => {
 
   test("matches command names case-insensitively", () => {
     expect(commandArg("/Agent fix tests", "agent")).toBe("fix tests");
+  });
+});
+
+describe("isSimpleGreeting", () => {
+  test("recognizes short greetings without matching real requests", () => {
+    expect(isSimpleGreeting("hii")).toBe(true);
+    expect(isSimpleGreeting("Good morning!")).toBe(true);
+    expect(isSimpleGreeting("what is the weather today?")).toBe(false);
   });
 });
 

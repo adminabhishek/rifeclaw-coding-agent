@@ -1,10 +1,19 @@
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { generateText, type LanguageModel, type GenerateTextResult } from "ai";
+import { generateText, wrapLanguageModel, type LanguageModel, type GenerateTextResult } from "ai";
+import type { LanguageModelV3 } from "@ai-sdk/provider";
 import { optionalEnv } from "../env";
 import { memoryManager } from "../src/ai/memory";
 import { createOllamaNativeAdapter } from "./ollama-tool-adapter";
+import { modelCacheMiddleware } from "../src/ai/model-cache-middleware.ts";
 
 const DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434";
+
+function withModelCache(model: LanguageModel): LanguageModel {
+  return wrapLanguageModel({
+    model: model as LanguageModelV3,
+    middleware: modelCacheMiddleware,
+  });
+}
 
 export interface StructuredOutput<T> {
   data: T;
@@ -12,7 +21,6 @@ export interface StructuredOutput<T> {
   timestamp: string;
 }
 
-// Helper to get the language model with memory context
 export function getAgentModel(): LanguageModel {
   const aiProvider = (optionalEnv("AI_PROVIDER") ?? "openrouter").toLowerCase();
 
@@ -22,19 +30,14 @@ export function getAgentModel(): LanguageModel {
       throw new Error("OLLAMA_MODEL not configured. Please run 'rifeclaw setup' or set it in .env");
     }
 
-    // Use Ollama's native /api/chat endpoint with native tool-calling format.
-    // Small local models follow this schema more reliably than the
-    // OpenAI-compatible /v1/chat/completions bridge used for OpenRouter.
-    return createOllamaNativeAdapter(
+    return withModelCache(createOllamaNativeAdapter(
       optionalEnv("OLLAMA_BASE_URL") ?? DEFAULT_OLLAMA_BASE_URL,
       ollamaModel,
-    );
+    ));
   }
 
   if (aiProvider !== "openrouter") {
-    throw new Error(
-      `Unsupported AI_PROVIDER: ${aiProvider}. Use "openrouter" or "ollama".`,
-    );
+    throw new Error(`Unsupported AI_PROVIDER: ${aiProvider}. Use "openrouter" or "ollama".`);
   }
 
   const apiKey = optionalEnv("OPENROUTER_API_KEY");
@@ -42,17 +45,30 @@ export function getAgentModel(): LanguageModel {
     throw new Error("OPENROUTER_API_KEY not configured. Please run 'rifeclaw setup' or set it in .env");
   }
 
-  const provider = createOpenRouter({ apiKey });
   const modelId = optionalEnv("OPENROUTER_DEFAULT_MODEL");
-
   if (!modelId) {
     throw new Error("OPENROUTER_DEFAULT_MODEL not configured. Please run 'rifeclaw setup' or set it in .env");
   }
 
-  return provider.chat(modelId);
+  const configuredEffort = (optionalEnv("OPENROUTER_REASONING_EFFORT") ?? "medium").toLowerCase();
+  const allowedEfforts = ["xhigh", "high", "medium", "low", "minimal", "none"] as const;
+  if (!allowedEfforts.includes(configuredEffort as (typeof allowedEfforts)[number])) {
+    throw new Error(
+      `Invalid OPENROUTER_REASONING_EFFORT: ${configuredEffort}. Use ${allowedEfforts.join(", ")}.`,
+    );
+  }
+
+  const reasoningEffort = configuredEffort as (typeof allowedEfforts)[number];
+  const reasoningEnabled = optionalEnv("OPENROUTER_REASONING_ENABLED")?.toLowerCase() !== "false";
+  const modelSettings = reasoningEnabled && reasoningEffort !== "none"
+    ? { reasoning: { enabled: true, effort: reasoningEffort } }
+    : {};
+
+  return withModelCache(
+    createOpenRouter({ apiKey }).chat(modelId, modelSettings)
+  );
 }
 
-// Generate with memory context
 export async function generateWithMemory(
   prompt: string,
   sessionId: string,
@@ -60,9 +76,8 @@ export async function generateWithMemory(
     system?: string;
     maxTokens?: number;
     temperature?: number;
-  }
-): Promise<GenerateTextResult<never, never>> {
-  // Add memory context to prompt
+  },
+): Promise<GenerateTextResult<any, any>> {
   const conversationContext = memoryManager.getRecentContext(sessionId);
   const memoryPrompt = conversationContext
     ? `Previous conversation:\n${conversationContext}\n\nCurrent question:\n${prompt}`
@@ -77,14 +92,10 @@ export async function generateWithMemory(
   });
 }
 
-// Structured output formatter
-export function formatStructuredOutput<T>(
-  data: T,
-  confidence = 1.0
-): StructuredOutput<T> {
+export function formatStructuredOutput<T>(data: T, confidence = 1.0): StructuredOutput<T> {
   return {
     data,
     confidence,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
   };
 }

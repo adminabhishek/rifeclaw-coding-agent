@@ -29,6 +29,10 @@ export function commandArg(fullText: string, name: string): string {
   return fullText.replace(new RegExp(`^/${name}\\s*`, 'i'), '').trim();
 }
 
+export function isSimpleGreeting(text: string): boolean {
+  return /^(?:hi+|hello|hey|heya|hiya|howdy|good\s+(?:morning|afternoon|evening))(?:\s+there)?[.!?…\s]*$/i.test(text.trim());
+}
+
 // ── TUI Formatting Utilities (adapted from tui/terminal-md.ts) ─────────────
 
 const TERMINAL_WIDTH = Math.max(40, Math.min(process.stdout.columns || 80, 120));
@@ -190,6 +194,10 @@ export function summaryBox(lines: { label: string; value: string | number }[]): 
 /** Escape Markdown special characters for Telegram's Markdown parser */
 export function escapeMarkdown(text: string): string {
   const escapeChars: Record<string, string> = {
+    // Escape backslashes first in effect: MarkdownV2 treats them as escape
+    // introducers, so leaving one in user/model text can cancel the escape
+    // added for a following character (for example `\\|` leaves `|` raw).
+    '\\': '\\\\',
     '*': '\\*',
     '_': '\\_',
     '[': '\\[',
@@ -213,15 +221,49 @@ export function escapeMarkdown(text: string): string {
   return text.split('').map(char => escapeChars[char] || char).join('');
 }
 
-/** Send clean Markdown to Telegram – no terminal rendering, no ANSI codes. */
+/** Send generated text to Telegram without terminal codes or MarkdownV2 escapes. */
 export async function replyMarkdown(
   ctx: { reply: (t: string, o?: object) => Promise<unknown> },
   text: string,
   opts: { parseMode?: "Markdown" | "MarkdownV2" | "HTML" } = {}
 ): Promise<unknown> {
-  const { parseMode = "Markdown" } = opts;
-  const escaped = escapeMarkdown(text);
-  return ctx.reply(escaped, { parse_mode: parseMode });
+  const { parseMode } = opts;
+  // Telegram's legacy Markdown parser does not understand MarkdownV2 escaping.
+  // Send generated Markdown as readable plain text by default, and split long
+  // answers below Telegram's 4096 character limit. Explicit parse modes are
+  // passed through unchanged because their callers own the corresponding syntax.
+  // Model output sometimes contains Telegram MarkdownV2 escapes even though
+  // these answers are sent as plain text. Drop those formatting escapes so
+  // users see `Hello!` instead of `Hello\!`; preserve ordinary path slashes.
+  const markdownV2Special = new Set("\\_*[]()~`>#+-=|{}.!".split(""));
+  const displayText = parseMode
+    ? text
+    : text.replace(/\\([\s\S])/g, (match, char: string) =>
+        markdownV2Special.has(char) ? char : match,
+      );
+  const chunks = splitTelegramText(displayText, parseMode ? 3800 : 3900);
+  let last: unknown;
+  for (const chunk of chunks) {
+    last = parseMode
+      ? await ctx.reply(chunk, { parse_mode: parseMode })
+      : await ctx.reply(chunk);
+  }
+  return last;
+}
+
+function splitTelegramText(text: string, limit: number): string[] {
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    let boundary = remaining.lastIndexOf("\n", limit);
+    if (boundary < limit * 0.55) boundary = remaining.lastIndexOf(" ", limit);
+    if (boundary < limit * 0.55) boundary = limit;
+    chunks.push(remaining.slice(0, boundary).trimEnd());
+    remaining = remaining.slice(boundary).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
 }
 
 /** Strip ANSI escape sequences (chalk colour codes) from a string. */

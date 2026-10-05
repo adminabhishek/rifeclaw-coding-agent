@@ -298,8 +298,9 @@ interface OllamaToolAdapterConfig {
  * - `doGenerate`: Returns a single turn with tool calls if the model decides to use tools.
  * - The finish reason is `'tool-calls'` when tools are invoked, allowing `ToolLoopAgent`
  *   to detect and execute them synchronously.
- * - `doStream`: Implemented but yields the same content as `doGenerate` (no true streaming
- *   for multi-turn tool loops).
+ * - `doStream`: Reads Ollama's NDJSON response incrementally so text can reach
+ *   the SDK as it is generated. Tool calls are emitted after their arguments
+ *   have been assembled.
  */
 export class OllamaToolAdapter implements LanguageModelV3 {
   readonly specificationVersion = "v3" as const;
@@ -406,51 +407,185 @@ export class OllamaToolAdapter implements LanguageModelV3 {
     stream: ReadableStream<LanguageModelV3StreamPart>;
     warnings: SharedV3Warning[];
   }> {
-    const data = await this.callOllama(options);
+    const body: OllamaChatRequest = {
+      model: this.modelId,
+      messages: convertPrompt(options.prompt),
+      tools: convertTools(
+        (options.tools ?? []).filter((t) => t.type === "function") as LanguageModelV3FunctionTool[],
+      ),
+      stream: true,
+      options: {
+        temperature: options.temperature,
+        top_p: options.topP,
+        top_k: options.topK,
+        num_predict: options.maxOutputTokens,
+        stop: options.stopSequences,
+      },
+    };
 
-    const stream = new ReadableStream<LanguageModelV3StreamPart>({
-      start(controller) {
-        const toolCalls = getToolCalls(data.message);
-        const textParts = data.message.content && toolCalls.length === 0
-          ? [{ type: "text", text: data.message.content } as LanguageModelV3Content]
-          : [];
-
-        for (const part of textParts) {
-          if (part.type === "text") {
-            controller.enqueue({ type: "text-start", id: "ollama-1" });
-            controller.enqueue({ type: "text-delta", id: "ollama-1", delta: part.text });
-            controller.enqueue({ type: "text-end", id: "ollama-1" });
-          }
-        }
-
-        for (const call of toolCalls) {
-          const id = generateToolCallId();
-          const input = normalizeToolArguments(call.function.arguments);
-
-          controller.enqueue({
-            type: "tool-input-start",
-            id,
-            toolName: call.function.name,
-          });
-          controller.enqueue({ type: "tool-input-delta", id, delta: input });
-          controller.enqueue({ type: "tool-input-end", id });
-          // Emit the final tool-call chunk which triggers tool execution
-          // in runToolsTransformation
-          controller.enqueue({
-            type: "tool-call",
-            toolCallId: id,
-            toolName: call.function.name,
-            input,
-          });
-        }
-
-        controller.enqueue({
-          type: "finish",
-          usage: makeUsage(data),
-          finishReason: makeFinishReason(data, toolCalls.length > 0),
+    const response = await fetch(`${this.baseURL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      const message = `Ollama API error ${response.status}: ${text || response.statusText}`;
+      if (isCudaInitializationError(message)) {
+        // Retry a streaming request on CPU when Ollama cannot initialize CUDA.
+        body.options = { ...body.options, num_gpu: 0 };
+        const fallback = await fetch(`${this.baseURL}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
         });
+        if (fallback.ok) return this.consumeOllamaStream(fallback);
+        const fallbackText = await fallback.text().catch(() => "");
+        throw new Error(`Ollama API error ${fallback.status}: ${fallbackText || fallback.statusText}`);
+      }
+      throw new Error(message);
+    }
 
-        controller.close();
+    return this.consumeOllamaStream(response);
+  }
+
+  private consumeOllamaStream(response: Response): {
+    stream: ReadableStream<LanguageModelV3StreamPart>;
+    warnings: SharedV3Warning[];
+  } {
+    const stream = new ReadableStream<LanguageModelV3StreamPart>({
+      start: (controller) => {
+        void (async () => {
+          if (!response.body) throw new Error("Ollama returned an empty response stream");
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffered = "";
+          let fullText = "";
+          let textStarted = false;
+          let textEnded = false;
+          let finished = false;
+          let responseModel = this.modelId;
+          let finalChunk: OllamaChatResponse | undefined;
+          const textId = "ollama-text-0";
+          const streamedCalls = new Map<number, OllamaToolCall>();
+
+          const emitText = (delta: string) => {
+            if (!delta) return;
+            fullText += delta;
+            if (!textStarted) {
+              controller.enqueue({ type: "text-start", id: textId });
+              textStarted = true;
+            }
+            controller.enqueue({ type: "text-delta", id: textId, delta });
+          };
+
+          const processLine = (line: string) => {
+            const trimmed = line.trim();
+            if (!trimmed) return;
+
+            const chunk = JSON.parse(trimmed) as Omit<OllamaChatResponse, "message"> & {
+              error?: string;
+              message?: Omit<OllamaChatResponse["message"], "tool_calls"> & {
+                tool_calls?: Array<OllamaToolCall & { index?: number }>;
+              };
+            };
+            if (chunk.error) throw new Error(`Ollama API error: ${chunk.error}`);
+            if (chunk.model) responseModel = chunk.model;
+
+            const message = chunk.message;
+            if (message?.content) emitText(message.content);
+
+            for (const [position, call] of (message?.tool_calls ?? []).entries()) {
+              const index = call.index ?? position;
+              const previous = streamedCalls.get(index);
+              if (!previous) {
+                streamedCalls.set(index, call);
+                continue;
+              }
+
+              const prevArgs = previous.function.arguments;
+              const nextArgs = call.function.arguments;
+              let args = nextArgs;
+              if (typeof prevArgs === "string" && typeof nextArgs === "string") {
+                args = nextArgs.startsWith(prevArgs) ? nextArgs : prevArgs + nextArgs;
+              } else if (
+                prevArgs && typeof prevArgs === "object" &&
+                nextArgs && typeof nextArgs === "object"
+              ) {
+                args = { ...prevArgs, ...nextArgs };
+              }
+              streamedCalls.set(index, {
+                function: {
+                  name: call.function.name || previous.function.name,
+                  arguments: args,
+                },
+              });
+            }
+
+            if (chunk.done) {
+              finalChunk = { ...chunk, model: responseModel } as OllamaChatResponse;
+              finished = true;
+            }
+          };
+
+          const finish = () => {
+            if (!finished || !finalChunk) throw new Error("Ollama stream ended before its final chunk");
+            if (textStarted && !textEnded) {
+              controller.enqueue({ type: "text-end", id: textId });
+              textEnded = true;
+            }
+
+            const message = {
+              ...finalChunk.message,
+              content: fullText,
+              tool_calls: streamedCalls.size
+                ? [...streamedCalls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call)
+                : finalChunk.message.tool_calls,
+            };
+            const data = { ...finalChunk, message };
+            const toolCalls = getToolCalls(message);
+
+            for (const call of toolCalls) {
+              const id = generateToolCallId();
+              const input = normalizeToolArguments(call.function.arguments);
+              controller.enqueue({ type: "tool-input-start", id, toolName: call.function.name });
+              controller.enqueue({ type: "tool-input-delta", id, delta: input });
+              controller.enqueue({ type: "tool-input-end", id });
+              controller.enqueue({
+                type: "tool-call",
+                toolCallId: id,
+                toolName: call.function.name,
+                input,
+              });
+            }
+
+            controller.enqueue({
+              type: "finish",
+              usage: makeUsage(data),
+              finishReason: makeFinishReason(data, toolCalls.length > 0),
+            });
+            controller.close();
+          };
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              buffered += decoder.decode(value, { stream: !done });
+              let newline = buffered.indexOf("\n");
+              while (newline >= 0) {
+                processLine(buffered.slice(0, newline));
+                buffered = buffered.slice(newline + 1);
+                newline = buffered.indexOf("\n");
+              }
+              if (done) break;
+            }
+            if (buffered.trim()) processLine(buffered);
+            finish();
+          } finally {
+            reader.releaseLock();
+          }
+        })().catch((error) => controller.error(error));
       },
     });
 

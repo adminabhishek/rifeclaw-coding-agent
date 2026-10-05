@@ -11,6 +11,7 @@ import { defaultAgentConfig } from "../agent/types.ts";
 import { renderTerminalMarkdown, summaryBox } from "../../tui/terminal-md.ts";
 import { runApprovalFlow } from "../agent/approval.ts";
 import { createWebTools } from "../plan/web-tools.ts";
+import { createLiveTokenUsageReporter } from "../../src/utils/live-token-usage.ts";
 
 // ── Command Recognition Patterns ───────────────────────────────────────
 // High-confidence patterns for common, low-risk operations
@@ -138,6 +139,18 @@ function createAskTools(executor: ToolExecutor) {
       },
     }),
 
+    read_files: tool({
+      description:
+        "Read up to 8 relevant workspace files in one call after locating them. Prefer this over several read_file calls when the paths are already known.",
+      inputSchema: z.object({ paths: z.array(z.string()).min(1).max(8) }),
+      execute: async ({ paths }) => {
+        console.log(chalk.cyan("  ->"), chalk.bold("read_files"), chalk.dim(paths.join(", ")));
+        const result = executor.readFiles(paths);
+        console.log(chalk.green("  <-"), chalk.bold("read_files"), chalk.dim(previewToolResult(result)));
+        return result;
+      },
+    }),
+
     list_files: tool({
       description: "List files and directories under a path.",
       inputSchema: z.object({
@@ -233,7 +246,7 @@ export async function runAskMode() {
     const question = await text({
       message: "What do you want to ask? Type /back to return.",
     });
-    if (isCancel(question)) return;
+    if (isCancel(question)) continue;
 
     const trimmedQuestion = question.trim();
     if (!trimmedQuestion) continue;
@@ -259,13 +272,32 @@ export async function runAskMode() {
 
           // Ask if they want to save
           const wantsSave = await confirm({
-            message: `Was this helpful? Save the answer?`,
+            message: "Save this answer to a Markdown file?",
             initialValue: true,
           });
           if (!isCancel(wantsSave) && wantsSave) {
-            const files = helpExec.name.toLowerCase().replace(/\s+/g, "_");
-            const filename = `quick-answer-${files}-${Date.now()}.md`;
-            console.log(chalk.dim(`\n📄 Saved to: ${filename}`));
+            const fileSlug = helpExec.name.toLowerCase().replace(/\s+/g, "_");
+            const filename = await text({
+              message: "Filename",
+              initialValue: `quick-answer-${fileSlug}-${Date.now()}.md`,
+              validate: (value) => validateAskFilename(value, defaultAgentConfig().codebasePath),
+            });
+            if (isCancel(filename)) continue;
+
+            const saveConfig = defaultAgentConfig();
+            const saveTracker = new ActionTracker();
+            const saveExecutor = new ToolExecutor(saveTracker, saveConfig);
+            saveExecutor.createFile(filename, asMd(trimmedQuestion, result));
+            const approved = await runApprovalFlow(saveTracker);
+            if (!approved) {
+              saveExecutor.clearStaging();
+              console.log(chalk.yellow("\nSave cancelled. No file was created.\n"));
+              continue;
+            }
+            const { errors } = saveExecutor.applyApprovedFromTracker();
+            saveExecutor.clearStaging();
+            if (errors.length) console.log(chalk.red(`\nCould not save the answer: ${errors.join("; ")}\n`));
+            else console.log(chalk.green(`\n✅ Saved to: ${filename}\n`));
           }
         } catch (error) {
           console.log(chalk.red(` ❌ Error: ${error}`));
@@ -336,19 +368,26 @@ export async function runAskMode() {
 
     console.log(chalk.cyan("  .."), chalk.bold("Thinking"), chalk.dim("choosing what to inspect"));
 
+    const reportTokenUsage = createLiveTokenUsageReporter();
+    const checksPerformed: string[] = [];
     const result = await agent.generate({
       prompt: trimmedQuestion,
-      onStepFinish: ({ toolCalls, text }) => {
-        const trimmedText = text?.trim();
-        if (trimmedText) {
-          console.log(chalk.cyan("  .."), chalk.bold("Drafted"), chalk.dim(previewToolResult(trimmedText)));
-        }
+      onStepFinish: ({ toolCalls, usage }) => {
+        reportTokenUsage(usage);
         for (const tc of toolCalls) {
+          checksPerformed.push(`${String(tc.toolName)}(${previewToolResult(tc.input)})`);
           console.log(chalk.yellow("  =>"), chalk.bold(String(tc.toolName)), chalk.dim(previewToolResult(tc.input)));
         }
       },
     });
     const answer = result.text?.trim() || "(no answer)";
+    if (checksPerformed.length) {
+      console.log(chalk.cyan("\n  What I checked:"));
+      for (const check of checksPerformed) console.log(chalk.dim(`  • ${check}`));
+      console.log(chalk.dim("  Summarizing the results below.\n"));
+    } else {
+      console.log(chalk.dim("\n  No codebase lookup was needed; preparing a direct answer.\n"));
+    }
     console.log(chalk.green("\n✅ Answer received:\n"));
     console.log(renderTerminalMarkdown(answer), "\n");
 

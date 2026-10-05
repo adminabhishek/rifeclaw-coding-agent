@@ -1,9 +1,9 @@
-import { Markup } from 'telegraf';
-import type { ActionTracker } from '../agent/action-tracker.ts';
-import type { ToolExecutor } from '../agent/tool-executor.ts';
-import type { ActionLog } from '../agent/types.ts';
-import { composeBeforeAfter, formatPatch } from '../agent/diff-view.ts';
-import { clip, escapeMarkdown } from './text.ts';
+import { Markup } from "telegraf";
+import type { ActionTracker } from "../agent/action-tracker.ts";
+import type { ToolExecutor } from "../agent/tool-executor.ts";
+import type { ActionLog } from "../agent/types.ts";
+import { composeBeforeAfter, formatPatch } from "../agent/diff-view.ts";
+import { escapeMarkdown } from "./text.ts";
 
 export interface ApprovalSession {
   tracker: ActionTracker;
@@ -16,11 +16,11 @@ export const approvalSessions = new Map<number, ApprovalSession>();
 function groupPending(pending: ActionLog[]) {
   const files = new Map<string, ActionLog[]>();
   const shells: ActionLog[] = [];
-  for (const a of pending) {
-    if (a.type === 'tool_execute') shells.push(a);
+  for (const action of pending) {
+    if (action.type === "tool_execute") shells.push(action);
     else {
-      if (!files.has(a.path)) files.set(a.path, []);
-      files.get(a.path)!.push(a);
+      if (!files.has(action.path)) files.set(action.path, []);
+      files.get(action.path)!.push(action);
     }
   }
   return { files, shells };
@@ -28,53 +28,56 @@ function groupPending(pending: ActionLog[]) {
 
 export function approvalSummary(pending: ActionLog[]): string {
   const { files, shells } = groupPending(pending);
-  const fileLines = [...files].map(([path, actions]) => {
-    const types = [...new Set(actions.map((a) => a.type.replace(/_/g, ' ')))].join(', ');
-    return `📄 \`${escapeMarkdown(path)}\` \\(${escapeMarkdown(types)}\\)`;
+  const fileLines = [...files].map(([filePath, actions]) => {
+    const types = [...new Set(actions.map((action) => action.type.replace(/_/g, " ")))].join(", ");
+    return `📄 \`${escapeMarkdown(filePath)}\` \\(${escapeMarkdown(types)}\\)`;
   });
-  const shellLines = shells.map((s) => `🖥 *Shell:* \`${escapeMarkdown(s.details.command ?? '')}\``);
+  const shellLines = shells.map((action) => `🖥 *Shell:* \`${escapeMarkdown(action.details.command ?? "")}\``);
   return [
-    '📋 *Staged Changes — Review Before Applying*',
-    '',
+    "📋 *Review these staged changes*",
+    "",
     ...fileLines,
     ...shellLines,
-    '',
-    `📦 *Total:* ${pending.length} change(s)`,
-  ].join('\n');
+    "",
+    `📦 *${pending.length} ${escapeMarkdown("staged change(s)")}* · ${escapeMarkdown("Nothing is applied until you approve.")}`,
+  ].join("\n");
 }
 
+/** Plain text diff content; the handler wraps it in an HTML <pre> block safely. */
 export function approvalDiff(pending: ActionLog[]): string {
   const { files, shells } = groupPending(pending);
   const parts: string[] = [];
   for (const [filePath, actions] of files) {
     const sorted = [...actions].sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
     const { before, after } = composeBeforeAfter(sorted);
-    parts.push(clip(formatPatch(filePath, before, after), 1500));
+    parts.push(formatPatch(filePath, before, after));
   }
-  for (const s of shells) parts.push(`🖥 *Shell:* \`${escapeMarkdown(s.details.command ?? '')}\``);
-  return parts.join('\n\n').trim();
+  for (const action of shells) {
+    parts.push(`SHELL COMMAND\n${action.details.command ?? "(empty command)"}`);
+  }
+  return parts.join("\n\n").trim();
 }
 
 async function promptApproval(
-  ctx: { reply: (t: string, o?: object) => Promise<unknown> },
+  ctx: { reply: (text: string, options?: object) => Promise<unknown> },
   chatId: number,
   session: ApprovalSession,
 ) {
   approvalSessions.set(chatId, session);
   await ctx.reply(approvalSummary(session.pending), {
     ...Markup.inlineKeyboard([
-      [Markup.button.callback('📋 Show Full Diff', 'approval_diff')],
+      [Markup.button.callback("👁 Preview diff", "approval_diff")],
       [
-        Markup.button.callback('✅ Accept All', 'approval_accept'),
-        Markup.button.callback('❌ Reject All', 'approval_reject'),
+        Markup.button.callback("✅ Apply changes", "approval_accept"),
+        Markup.button.callback("🗑 Discard", "approval_reject"),
       ],
     ]),
-    parse_mode: 'MarkdownV2',
+    parse_mode: "MarkdownV2",
   });
 }
 
 export async function finishOrApprove(
-  ctx: { reply: (t: string, o?: object) => Promise<unknown> },
+  ctx: { reply: (text: string, options?: object) => Promise<unknown> },
   chatId: number,
   tracker: ActionTracker,
   executor: ToolExecutor,

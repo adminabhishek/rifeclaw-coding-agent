@@ -1,8 +1,9 @@
 import { Telegraf } from "telegraf";
 import chalk from "chalk";
-import { buildWelcomeMessage } from "./help";
+import { buildWelcomeMessage, welcomeKeyboard } from "./help";
 import { registerHandlers } from "./handlers";
 import { requireEnv } from "../../env.ts";
+import { memoryManager } from "../../src/ai/memory.ts";
 
 const RETRYABLE_NETWORK_CODES = new Set([
   "ECONNRESET",
@@ -51,18 +52,35 @@ async function wait(ms: number): Promise<void> {
 }
 
 export async function runTelegramMode() {
+  memoryManager.loadFromDisk();
   const token = requireEnv("TELEGRAM_BOT_TOKEN");
   const ownerId = requireEnv("TELEGRAM_OWNER_ID");
 
   const bot = new Telegraf(token);
   registerHandlers(bot);
 
+  try {
+    await bot.telegram.setMyCommands([
+      { command: "ask", description: "Ask a read-only question about your project" },
+      { command: "plan", description: "Plan a change and choose steps to run" },
+      { command: "agent", description: "Make a change with your approval" },
+      { command: "help", description: "Show commands and examples" },
+      { command: "start", description: "Open the RifeClaw home screen" },
+      { command: "cancel", description: "Cancel a quick-start prompt" },
+    ]);
+  } catch (error) {
+    console.error(chalk.yellow("Could not update Telegram command menu:"), getSafeErrorDetails(error));
+  }
+
   bot.catch((error) => {
     console.error(chalk.red("Telegram handler error:"), getSafeErrorDetails(error));
   });
 
   try {
-    await bot.telegram.sendMessage(ownerId, buildWelcomeMessage(), { parse_mode: "MarkdownV2" });
+    await bot.telegram.sendMessage(ownerId, buildWelcomeMessage(), {
+      parse_mode: "MarkdownV2",
+      ...welcomeKeyboard(),
+    });
   } catch (error) {
     console.error(chalk.red("Could not send Telegram welcome message:"), getSafeErrorDetails(error));
     return;
@@ -78,7 +96,7 @@ export async function runTelegramMode() {
     while (!stopping) {
       try {
         activeBot = true;
-        await bot.launch();
+        await bot.launch({ allowedUpdates: ["message", "callback_query"] });
       } catch (error) {
         activeBot = false;
         if (stopping) return;

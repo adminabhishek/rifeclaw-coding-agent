@@ -6,12 +6,66 @@ import { requireEnv } from "../../env.ts";
 
 let client: Firecrawl | null = null;
 
+// Rate limiting configuration
+const RATE_LIMIT_MS = 1000; // Minimum delay between requests (1 second)
+let lastRequestTime = 0;
+
+// Usage tracking
+interface WebToolUsage {
+  searchCount: number;
+  crawlCount: number;
+  fetchCount: number;
+  lastReset: number;
+}
+
+const usage: WebToolUsage = {
+  searchCount: 0,
+  crawlCount: 0,
+  fetchCount: 0,
+  lastReset: Date.now(),
+};
+
+const USAGE_WINDOW_MS = 60 * 60 * 1000;
+
+function resetUsageIfNeeded(now = Date.now()): void {
+  if (now - usage.lastReset < USAGE_WINDOW_MS) return;
+  usage.searchCount = 0;
+  usage.crawlCount = 0;
+  usage.fetchCount = 0;
+  usage.lastReset = now;
+}
+
+function recordUsage(kind: "searchCount" | "crawlCount" | "fetchCount"): void {
+  resetUsageIfNeeded();
+  usage[kind]++;
+}
+
 function getClient(): Firecrawl {
   if (client) return client;
   client = new Firecrawl({
     apiKey: requireEnv("FIRECRAWL_API_KEY"),
   });
   return client;
+}
+
+/**
+ * Enforces rate limiting between web requests
+ */
+async function rateLimit(): Promise<void> {
+  const now = Date.now();
+  const requestAt = Math.max(now, lastRequestTime + RATE_LIMIT_MS);
+  // Reserve the next slot before yielding so simultaneous callers are spaced too.
+  lastRequestTime = requestAt;
+  const waitTime = requestAt - now;
+  if (waitTime > 0) await new Promise((resolve) => setTimeout(resolve, waitTime));
+}
+
+/**
+ * Gets current usage statistics
+ */
+function getUsageStats(): WebToolUsage {
+  resetUsageIfNeeded();
+  return { ...usage };
 }
 
 export function hasWebTools(): boolean {
@@ -31,6 +85,12 @@ export function createWebTools(tracker: ActionTracker) {
         limit: z.number().int().min(1).max(10).optional().default(5),
       }),
       execute: async ({ query, limit }) => {
+        // Apply rate limiting
+        await rateLimit();
+
+        // Track usage
+        recordUsage("searchCount");
+
         const res = await getClient().search(query, {
           limit,
           sources: ["web"],
@@ -63,6 +123,12 @@ export function createWebTools(tracker: ActionTracker) {
       description: 'Scrape a URL into markdown text.',
       inputSchema: z.object({ url: z.string().url() }),
       execute: async ({ url }) => {
+        // Apply rate limiting
+        await rateLimit();
+
+        // Track usage
+        recordUsage("crawlCount");
+
         const doc = await getClient().scrape(url, { formats: ['markdown'] });
         const md = (doc as { markdown?: string }).markdown ?? '';
         tracker.log({
@@ -79,6 +145,10 @@ export function createWebTools(tracker: ActionTracker) {
       description: 'HTTP GET for a URL. Returns response body.',
       inputSchema: z.object({ url: z.string().url() }),
       execute: async ({ url }) => {
+        // Apply rate limiting
+        await rateLimit();
+        recordUsage("fetchCount");
+
         const r = await fetch(url, { redirect: 'follow' });
         const body = await r.text();
         const out = clip(body, 16_000);
@@ -93,3 +163,6 @@ export function createWebTools(tracker: ActionTracker) {
     }),
   };
 }
+
+// Export usage stats for external access
+export { getUsageStats };

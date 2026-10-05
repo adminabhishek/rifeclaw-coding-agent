@@ -15,14 +15,7 @@ import { printPlan, selectSteps } from "./selection";
 import { persistPlan } from "./persistence";
 import type { PlanStep } from "./types";
 import { createWebTools, hasWebTools } from "./web-tools";
-
-// ── Tool result preview ───────────────────────────────────────────────────
-function previewToolResult(result: unknown): string {
-  const textResult =
-    typeof result === "string" ? result : JSON.stringify(result, null, 2);
-  const singleLine = (textResult ?? "").replace(/\s+/g, " ").trim();
-  return singleLine.length > 140 ? `${singleLine.slice(0, 140)}...` : singleLine;
-}
+import { createLiveTokenUsageReporter, type TokenUsageSnapshot } from "../../src/utils/live-token-usage.ts";
 
 export function stepPrompt(goal: string, step: PlanStep): string {
   return [`Goal: ${goal}`, `Step: ${step.title}`, step.description].join("\n");
@@ -31,7 +24,7 @@ export function stepPrompt(goal: string, step: PlanStep): string {
 interface StepAgent {
   stream(input: {
     prompt: string;
-    onStepFinish?: (data: { toolCalls?: unknown[]; text?: string | null }) => void;
+    onStepFinish?: (data: { toolCalls?: unknown[]; text?: string | null; usage?: TokenUsageSnapshot }) => void;
   }): Promise<{
     textStream: AsyncIterable<string>;
     text: Promise<string>;
@@ -46,59 +39,62 @@ interface PlanExecutionDeps {
   print: (message: string) => void;
   printError: (message: string) => void;
   renderMarkdown: (source: string) => string;
+  hasPendingChanges?: () => boolean;
+  onTokenUsage?: (usage: TokenUsageSnapshot) => void;
+}
+
+export interface PlanExecutionResult {
+  outcome: "no_changes" | "rejected" | "applied" | "failed";
+  errors: string[];
 }
 
 export async function executePlanSteps(
   goal: string,
   selected: PlanStep[],
   deps: PlanExecutionDeps,
-): Promise<void> {
+): Promise<PlanExecutionResult> {
   for (const step of selected) {
     deps.print(chalk.bold(`\n🔧 Running: ${step.title}\n`));
 
     const agent = deps.createStepAgent();
     const result = await agent.stream({
       prompt: stepPrompt(goal, step),
-      onStepFinish: ({ toolCalls }) => {
-        // Log tool calls as activity signals; the streamed output below
-        // is the one source of truth for the step's text.
-        for (const tc of toolCalls ?? []) {
-          deps.print(
-            chalk.yellow("  =>") + " " + chalk.bold(String((tc as { toolName?: unknown }).toolName)) + " " + chalk.dim(previewToolResult((tc as { input?: unknown }).input))
-          );
-        }
-      },
+      onStepFinish: ({ usage }) => usage && deps.onTokenUsage?.(usage),
     });
 
-    // Stream output line-by-line so the user sees the model think in real time.
-    // Buffer chunks and flush on each newline to avoid half-line updates.
     let buffer = "";
-    let lineCount = 0;
     for await (const chunk of result.textStream) {
       buffer += chunk;
-      const lines = buffer.split("\n");
-      // Keep the last segment (possibly partial line) in the buffer
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        deps.print(deps.renderMarkdown(line));
-        lineCount++;
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        if (((block.match(/```/g) ?? []).length % 2) === 1) {
+          const next = buffer.indexOf("\n\n", boundary + 2);
+          if (next < 0) break;
+          boundary = next;
+          continue;
+        }
+        if (block.trim()) deps.print(deps.renderMarkdown(block));
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
       }
     }
-    // Flush any trailing content (no newline at end of stream)
     if (buffer.trim().length > 0) {
       deps.print(deps.renderMarkdown(buffer));
-      lineCount++;
     }
-    if (lineCount === 0) {
-      // Stream produced no text — fall back to a final message
-      deps.print(chalk.dim("(no output)"));
-    }
+  }
+
+  if (deps.hasPendingChanges && !deps.hasPendingChanges()) {
+    deps.print(chalk.green("\nPlan steps finished. No file changes were needed.\n"));
+    deps.clearStaging();
+    return { outcome: "no_changes", errors: [] };
   }
 
   const ok = await deps.approve();
   if (!ok) {
     deps.clearStaging();
-    return;
+    deps.print(chalk.yellow("\nChanges discarded. Nothing was applied.\n"));
+    return { outcome: "rejected", errors: [] };
   }
 
   const { errors } = deps.applyApproved();
@@ -109,9 +105,10 @@ export async function executePlanSteps(
     deps.print(chalk.green("\n✅ All changes applied successfully!\n"));
   }
   deps.clearStaging();
+  return { outcome: errors.length ? "failed" : "applied", errors };
 }
 
-export async function runPlanMode(): Promise<void> {
+export async function runPlanMode(): Promise<boolean> {
   console.log(chalk.bold("\n🗺 Plan Mode\n"));
   console.log(chalk.cyan("🔍 Ready to receive a plan goal. Type /back to return.\n"));
 
@@ -120,10 +117,10 @@ export async function runPlanMode(): Promise<void> {
     placeholder: "High-level objective for this plan...",
   });
 
-  if (isCancel(goal) || !goal.trim()) return;
+  if (isCancel(goal) || !goal.trim()) return true;
 
   const trimmedGoal = goal.trim();
-  if (trimmedGoal.toLowerCase() === "/back") return;
+  if (trimmedGoal.toLowerCase() === "/back") return false;
 
   // Load memory from disk so prior sessions are available
   memoryManager.loadFromDisk();
@@ -135,6 +132,7 @@ export async function runPlanMode(): Promise<void> {
 
   // Surface prior context if any
   const priorContext = memoryManager.getRecentContext(sessionId);
+  const reportTokenUsage = createLiveTokenUsageReporter();
   if (priorContext) {
     const turns = memoryManager.getMessages(sessionId, 50).length;
     console.log(chalk.dim(`\n💾 Loaded ${turns} prior message${turns !== 1 ? 's' : ''} from this project\n`));
@@ -149,7 +147,7 @@ export async function runPlanMode(): Promise<void> {
   console.log(chalk.dim("   (analyzing goals, creating steps)\n"));
 
   // Pass prior context to the planner if available
-  const plan = await generatePlan(trimmedGoal, priorContext || undefined);
+  const plan = await generatePlan(trimmedGoal, priorContext || undefined, reportTokenUsage);
 
   // Record plan in memory
   const planSummary = `Goal: ${plan.goal}\nSteps: ${plan.steps.map(s => s.title).join(', ')}`;
@@ -165,25 +163,40 @@ export async function runPlanMode(): Promise<void> {
   }
 
   const selected = await selectSteps(plan);
-  if (selected.length === 0) return;
+  if (selected.length === 0) {
+    memoryManager.updateTask(taskId, { status: "failed", result: "Plan cancelled before execution" });
+    memoryManager.saveToDisk();
+    return true;
+  }
 
   const proceed = await confirm({
     message: `⚡ Execute ${selected.length} step(s)`,
     initialValue: true,
   });
-  if (isCancel(proceed) || !proceed) return;
+  if (isCancel(proceed) || !proceed) {
+    memoryManager.updateTask(taskId, { status: "failed", result: "Plan cancelled before execution" });
+    memoryManager.saveToDisk();
+    return true;
+  }
 
   console.log(chalk.cyan("\n🚀 Starting plan execution...\n"));
 
   const tracker = new ActionTracker();
   const executor = new ToolExecutor(tracker, config);
 
+  const preview = (value: unknown) => {
+    const text = typeof value === "string" ? value : JSON.stringify(value);
+    return (text ?? "").replace(/\s+/g, " ").slice(0, 140);
+  };
   const tools = {
-    ...createAgentTools(executor),
+    ...createAgentTools(executor, {
+      onToolStart: (name, input) => console.log(chalk.yellow("  →"), chalk.bold(name), chalk.dim(preview(input))),
+      onToolFinish: (name, output) => console.log(chalk.green("  ✓"), chalk.bold(name), chalk.dim(preview(output))),
+    }),
     ...(hasWebTools() ? createWebTools(tracker) : {}),
   };
 
-  await executePlanSteps(plan.goal, selected, {
+  const execution = await executePlanSteps(plan.goal, selected, {
     createStepAgent: () =>
       new ToolLoopAgent({
         model: getAgentModel(),
@@ -196,9 +209,21 @@ export async function runPlanMode(): Promise<void> {
     print: (message) => console.log(message),
     printError: (message) => console.log(message),
     renderMarkdown: renderTerminalMarkdown,
+    hasPendingChanges: () => tracker.getPendingMutations().length > 0,
+    onTokenUsage: reportTokenUsage,
   });
 
-  // Update task status and save memory
-  memoryManager.updateTask(taskId, { status: 'completed', result: `Executed ${selected.length} steps` });
+  const taskResult = execution.outcome === "applied"
+    ? `Executed ${selected.length} steps and applied changes`
+    : execution.outcome === "no_changes"
+      ? `Executed ${selected.length} steps; no file changes were needed`
+      : execution.outcome === "rejected"
+        ? "Changes rejected by user"
+        : execution.errors.join("\n");
+  memoryManager.updateTask(taskId, {
+    status: execution.outcome === "applied" || execution.outcome === "no_changes" ? "completed" : "failed",
+    result: taskResult,
+  });
   memoryManager.saveToDisk();
+  return true;
 }

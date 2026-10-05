@@ -27,7 +27,9 @@ describe("approvalSummary", () => {
 
     expect(summary).toContain("app\\.ts");
     expect(summary).toContain("bun test");
-    expect(summary).toContain("2 change(s)");
+    // MarkdownV2 requires parentheses to be escaped in the rendered summary.
+    expect(summary).toContain("2 staged change\\(s\\)");
+    expect(summary).toContain("Nothing is applied until you approve\\.");
   });
 });
 

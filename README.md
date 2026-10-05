@@ -82,6 +82,8 @@ You can also copy `.env.example` to `.env` and fill in the values manually:
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_openrouter_key
 OPENROUTER_DEFAULT_MODEL=openai/gpt-4.1
+OPENROUTER_REASONING_ENABLED=true
+OPENROUTER_REASONING_EFFORT=medium
 
 # Local offline option
 # AI_PROVIDER=ollama
@@ -102,6 +104,8 @@ Ollama models, estimates your system RAM, suggests a model that should fit,
 lets you pick from common local models, and also lets you enter any Ollama
 model tag manually. It can run `ollama pull <model>` for the selected model.
 Firecrawl web tools and OpenRouter still require internet access.
+Reasoning output depends on model support and is shown in CLI Agent Mode when the
+selected OpenRouter model returns reasoning tokens.
 
 ## Commands
 

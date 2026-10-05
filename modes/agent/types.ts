@@ -37,6 +37,7 @@ export interface AgentConfig {
     allowFileCreation: boolean;
     allowFolderCreation: boolean;
   };
+  codebaseTokenLimit?: number;
 }
 
 export const defaultAgentConfig = (): AgentConfig => ({
@@ -57,6 +58,7 @@ export const defaultAgentConfig = (): AgentConfig => ({
     allowFileCreation: true,
     allowFolderCreation: true,
   },
+  codebaseTokenLimit: 8000,
 });
 
 export function isMutationType(t: ActionType): boolean {

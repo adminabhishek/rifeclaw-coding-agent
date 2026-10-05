@@ -1,13 +1,11 @@
 /**
- * Build script: bundles the entire RifeClaw CLI into a single ESM file
- * per entry point using Bun's native bundler. The output runs on plain
+ * Build script: bundles the entire RifeClaw CLI into one ESM entry
+ * using Bun's native bundler. The output runs on plain
  * node >= 18 (no Bun runtime required for end users).
  *
  * Outputs:
  *   dist/index.js   — main CLI entry (handles all commands)
- *   dist/setup.js   — standalone setup wizard
- *   dist/doctor.js  — standalone doctor
- *   dist/env.js     — required by the bundle at runtime
+ *   dist/.env.example — copied setup template when present
  *
  * Usage:
  *   bun run build         # development build (with sourcemaps, no minify)

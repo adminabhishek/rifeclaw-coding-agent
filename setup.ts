@@ -12,6 +12,8 @@ const KNOWN_KEYS = [
   "AI_PROVIDER",
   "OPENROUTER_API_KEY",
   "OPENROUTER_DEFAULT_MODEL",
+  "OPENROUTER_REASONING_ENABLED",
+  "OPENROUTER_REASONING_EFFORT",
   "OLLAMA_MODEL",
   "OLLAMA_BASE_URL",
   "FIRECRAWL_API_KEY",
@@ -268,6 +270,10 @@ function envLines(values: Map<string, string>): string {
     `OPENROUTER_API_KEY=${values.get("OPENROUTER_API_KEY") ?? ""}`,
     `OPENROUTER_DEFAULT_MODEL=${values.get("OPENROUTER_DEFAULT_MODEL") ?? "openai/gpt-4.1"}`,
     "",
+    "# OpenRouter reasoning settings",
+    `OPENROUTER_REASONING_ENABLED=${values.get("OPENROUTER_REASONING_ENABLED") ?? "true"}`,
+    `OPENROUTER_REASONING_EFFORT=${values.get("OPENROUTER_REASONING_EFFORT") ?? "medium"}`,
+    "",
     "# Ollama local settings",
     `OLLAMA_MODEL=${values.get("OLLAMA_MODEL") ?? "qwen2.5-coder:7b"}`,
     `OLLAMA_BASE_URL=${values.get("OLLAMA_BASE_URL") ?? "http://localhost:11434/v1"}`,
@@ -342,6 +348,25 @@ export async function runSetup(projectPath = getProjectPath()): Promise<void> {
     });
     if (isCancel(model)) return;
     values.set("OPENROUTER_DEFAULT_MODEL", model.trim());
+
+    const enableReasoning = await confirm({
+      message: "Enable model reasoning when supported?",
+      initialValue: envValue(values, "OPENROUTER_REASONING_ENABLED").toLowerCase() !== "false",
+    });
+    if (isCancel(enableReasoning)) return;
+    values.set("OPENROUTER_REASONING_ENABLED", String(enableReasoning));
+
+    if (enableReasoning) {
+      const effortOptions = ["minimal", "low", "medium", "high", "xhigh"];
+      const currentEffort = envValue(values, "OPENROUTER_REASONING_EFFORT").toLowerCase();
+      const effort = await autocomplete({
+        message: "Reasoning effort",
+        initialValue: effortOptions.includes(currentEffort) ? currentEffort : "medium",
+        options: effortOptions.map((value) => ({ value, label: value })),
+      });
+      if (isCancel(effort)) return;
+      values.set("OPENROUTER_REASONING_EFFORT", effort);
+    }
   }
 
   const enableWeb = await confirm({

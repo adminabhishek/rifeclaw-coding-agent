@@ -7,23 +7,19 @@ import { createAgentTools } from "../agent/agent-tools.ts";
 import { defaultAgentConfig, type AgentConfig } from "../agent/types.ts";
 import { createWebTools, hasWebTools } from "../plan/web-tools.ts";
 import type { Plan, PlanStep } from "../plan/types.ts";
-import { replyMarkdown, escapeMarkdown } from "./text.ts";
+import { replyMarkdown, escapeMarkdown, isSimpleGreeting } from "./text.ts";
 import { finishOrApprove } from "./approval-session.ts";
 import { memoryManager } from "../../src/ai/memory.ts";
+import { telegramProviderError } from "./provider-error.ts";
+import { welcomeKeyboard } from "./help.ts";
 
-// ── Enhanced Loading Messages ────────────────────────────────────────────────
-const LOADING_MESSAGES = [
-  "🤖 *Analyzing your request…*",
-  "🔍 *Scanning codebase…*",
-  "🧠 *Thinking through the task…*",
-  "⚡ *Executing tools…*",
-];
+// Keep ask feedback to one concise status message per request.
+const ASK_LOADING_MESSAGE = "🔎 Analyzing your question…";
 
 type ReplyContext = { reply: (t: string, o?: object) => Promise<unknown> };
 
-async function showLoading(ctx: ReplyContext, idx: number) {
-  const message = LOADING_MESSAGES[idx] ?? LOADING_MESSAGES[0] ?? "⏳ *Working…*";
-  return ctx.reply(message, { parse_mode: "MarkdownV2" });
+async function showLoading(ctx: ReplyContext) {
+  return ctx.reply(ASK_LOADING_MESSAGE);
 }
 
 // ── Better Tool Result Formatting ────────────────────────────────────────────
@@ -47,12 +43,6 @@ function formatToolResult(result: unknown): string {
   return singleLine || "✓ Done";
 }
 
-async function showToolStart(ctx: ReplyContext, name: string, input?: unknown) {
-  const toolDisplay = formatToolName(name);
-  const inputInfo = input !== undefined ? ` ${formatToolResult(input)}` : "";
-  await ctx.reply(`⚡ ${toolDisplay}${inputInfo}`);
-}
-
 async function showToolDone(ctx: ReplyContext, name: string, result: unknown) {
   const toolDisplay = formatToolName(name);
   const resultText = formatToolResult(result);
@@ -73,6 +63,7 @@ async function done(ctx: ReplyContext, label: string = "Ask"): Promise<void> {
     `━━━━━━━━━━━━━━━━━━\n` +
     `✅ ${label} complete · ⏱ ${nowStamp()}\n` +
     `━━━━━━━━━━━━━━━━━━`,
+    { ...welcomeKeyboard() },
   );
 }
 
@@ -93,18 +84,20 @@ async function doneWithSummary(
     `━━━━━━━━━━━━━━━━━━\n` +
     `${parts.join(" · ")}\n` +
     `━━━━━━━━━━━━━━━━━━`,
+    { ...welcomeKeyboard() },
   );
 }
 
-async function partialDone(ctx: ReplyContext, label: string, reason: string): Promise<void> {
-  const safe = (reason || "unknown error")
+async function partialDone(ctx: ReplyContext, label: string, reason: unknown): Promise<void> {
+  const safe = telegramProviderError(reason)
     .replace(/\r?\n/g, " ")
-    .slice(0, 200);
+    .slice(0, 350);
   await ctx.reply(
     `━━━━━━━━━━━━━━━━━━\n` +
     `⚠️ ${label} stopped — ${safe}\n` +
     `⏱ ${nowStamp()}\n` +
     `━━━━━━━━━━━━━━━━━━`,
+    { ...welcomeKeyboard() },
   );
 }
 
@@ -218,8 +211,12 @@ function agentOptions(config: AgentConfig, maxSteps: number) {
     instructions: [
       `Workspace root: ${config.codebasePath}`,
       "Use paths relative to the workspace root.",
+      "Treat saved conversation as context only. Inspect current workspace files before making codebase claims or changes; files on disk are the source of truth.",
+      "Use saved conversation only when the current message clearly depends on it; otherwise answer the current message on its own.",
+      "Use web tools only when the user asks for current information or web research. Do not search for greetings, small talk, or questions answerable from the workspace.",
+      "For a simple greeting, respond briefly and do not use tools.",
       "For the workspace root, always pass path: \".\". Never pass \"/\", \"\\\", or the absolute workspace path.",
-      "After using tools, answer in normal markdown. Do not show raw tool-call JSON.",
+      "After using tools, answer in normal Markdown. Do not use Telegram MarkdownV2 escaping (for example, do not write \\!); do not show raw tool-call JSON.",
     ].join("\n"),
   };
 }
@@ -231,9 +228,18 @@ function createReadOnlyTools(executor: ToolExecutor, ctx: ReplyContext) {
       inputSchema: z.object({ path: z.string() }),
       execute: async ({ path: p }) => {
         const path = normalizeWorkspacePath(p);
-        await showToolStart(ctx, "read_file", { path });
         const result = executor.readFile(path);
         await showToolDone(ctx, "read_file", result);
+        return result;
+      },
+    }),
+    read_files: tool({
+      description:
+        "Read up to 8 relevant workspace files in one call after locating them. Prefer this over several read_file calls when the paths are already known.",
+      inputSchema: z.object({ paths: z.array(z.string()).min(1).max(8) }),
+      execute: async ({ paths }) => {
+        const result = executor.readFiles(paths.map(normalizeWorkspacePath));
+        await showToolDone(ctx, "read_files", result);
         return result;
       },
     }),
@@ -245,7 +251,6 @@ function createReadOnlyTools(executor: ToolExecutor, ctx: ReplyContext) {
       }),
       execute: async ({ path: p, recursive }) => {
         const path = normalizeWorkspacePath(p);
-        await showToolStart(ctx, "list_files", { path, recursive });
         const result = executor.listFiles(path, recursive);
         await showToolDone(ctx, "list_files", result);
         return result;
@@ -261,7 +266,6 @@ function createReadOnlyTools(executor: ToolExecutor, ctx: ReplyContext) {
       }),
       execute: async ({ root, pattern, content_contains }) => {
         const safeRoot = normalizeWorkspacePath(root);
-        await showToolStart(ctx, "search_files", { root: safeRoot, pattern, content_contains });
         const result = executor.searchFiles(safeRoot, pattern, content_contains);
         await showToolDone(ctx, "search_files", result);
         return result;
@@ -272,7 +276,6 @@ function createReadOnlyTools(executor: ToolExecutor, ctx: ReplyContext) {
       inputSchema: z.object({ path: z.string().default(".") }),
       execute: async ({ path: p }) => {
         const path = normalizeWorkspacePath(p);
-        await showToolStart(ctx, "analyze_codebase", { path });
         const result = executor.analyzeCodebase(path);
         await showToolDone(ctx, "analyze_codebase", result);
         return result;
@@ -285,15 +288,25 @@ function extraWebTools(tracker: ActionTracker) {
   return hasWebTools() ? createWebTools(tracker) : {};
 }
 
-export async function runAsk(ctx: { reply: (t: string, o?: object) => Promise<unknown> }, question: string) {
+export async function runAsk(ctx: { reply: (t: string, o?: object) => Promise<unknown> }, chatId: number, question: string, abortSignal?: AbortSignal) {
   const config = readOnlyConfig();
   const tracker = new ActionTracker();
   const executor = new ToolExecutor(tracker, config);
-  const sessionId = `telegram_ask_${Date.now()}`;
+  const sessionId = memoryManager.resolveSessionId(`telegram_ask_${chatId}`, config.codebasePath);
   const startMs = Date.now();
+  const priorContext = memoryManager.getRecentContext(sessionId);
   memoryManager.addMessage(sessionId, 'user', question);
 
   try {
+    if (isSimpleGreeting(question)) {
+      const greeting = "Hi! How can I help?";
+      memoryManager.addMessage(sessionId, "assistant", greeting);
+      memoryManager.saveToDisk();
+      await ctx.reply(greeting);
+      await doneWithSummary(ctx, "Ask", { durationMs: Date.now() - startMs });
+      return;
+    }
+
     const wantsDescriptions = /describe|description|what is|explain|what does|brief/i.test(question);
 
     if (isDirectoryStructureQuestion(question)) {
@@ -308,22 +321,17 @@ export async function runAsk(ctx: { reply: (t: string, o?: object) => Promise<un
           tools,
         });
 
-        await ctx.reply("🔍 *Analyzing codebase…*", { parse_mode: "MarkdownV2" });
-        await showLoading(ctx, Math.floor(Math.random() * LOADING_MESSAGES.length));
+        await showLoading(ctx);
 
         const { text } = await agent.generate({
-          prompt: `Provide a comprehensive overview of this codebase:
+          abortSignal,
+          prompt: `${priorContext ? `Conversation context:\n${priorContext}\n\n` : ""}Provide a comprehensive overview of this codebase:
 
 1. Show the complete directory tree (use tree format)
 2. Give a brief description of each important file/directory
 3. Explain the purpose of major components
 
 Focus on giving useful context for someone reading the code.`,
-          onStepFinish: async ({ toolCalls, text }) => {
-            for (const tc of toolCalls) {
-              await showToolStart(ctx, String(tc.toolName), tc.input);
-            }
-          },
         });
 
         memoryManager.addMessage(sessionId, 'assistant', text || tree);
@@ -335,7 +343,7 @@ Focus on giving useful context for someone reading the code.`,
 
       memoryManager.addMessage(sessionId, 'assistant', tree);
       memoryManager.saveToDisk();
-      await ctx.reply(tree, { parse_mode: "MarkdownV2" });
+      await replyMarkdown(ctx, tree);
       await doneWithSummary(ctx, "Ask", { durationMs: Date.now() - startMs });
       return;
     }
@@ -346,15 +354,10 @@ Focus on giving useful context for someone reading the code.`,
       tools,
     });
 
-    await ctx.reply("🔍 *Analyzing your question…*", { parse_mode: "MarkdownV2" });
-    await showLoading(ctx, Math.floor(Math.random() * LOADING_MESSAGES.length));
+    await showLoading(ctx);
     const { text } = await agent.generate({
-      prompt: question,
-      onStepFinish: async ({ toolCalls }) => {
-        for (const tc of toolCalls) {
-          await showToolStart(ctx, String(tc.toolName), tc.input);
-        }
-      },
+      prompt: priorContext ? `Conversation context:\n${priorContext}\n\nCurrent question:\n${question}` : question,
+      abortSignal,
     });
 
     memoryManager.addMessage(sessionId, 'assistant', text || 'no answer');
@@ -363,33 +366,52 @@ Focus on giving useful context for someone reading the code.`,
     await replyMarkdown(ctx, text || "No answer generated.");
     await doneWithSummary(ctx, "Ask", { durationMs: Date.now() - startMs });
   } catch (err) {
-    await partialDone(ctx, "Ask", err instanceof Error ? err.message : String(err));
-    throw err;
+    if (abortSignal?.aborted) {
+      await ctx.reply("⏹ Question cancelled.");
+      return;
+    }
+    await partialDone(ctx, "Ask", err);
   }
 }
 
-export async function runAgent(ctx: { reply: (t: string, o?: object) => Promise<unknown> }, chatId: number, goal: string) {
-  // Create session for memory
-  const sessionId = `telegram_agent_${chatId}_${Date.now()}`;
+export async function runAgent(ctx: { reply: (t: string, o?: object) => Promise<unknown> }, chatId: number, goal: string, abortSignal?: AbortSignal) {
+  const config = defaultAgentConfig();
+  const sessionId = memoryManager.resolveSessionId(`telegram_agent_${chatId}`, config.codebasePath);
+  const priorContext = memoryManager.getRecentContext(sessionId);
   const taskId = memoryManager.createTask(goal);
   memoryManager.addMessage(sessionId, 'user', goal);
   const startMs = Date.now();
 
   // Clean header message
   await ctx.reply("🤖 *Agent Mode Started*\n\n🎯 *Task:* " + escapeMarkdown(goal), { parse_mode: "MarkdownV2" });
-  await ctx.reply("🔍 Analyzing request…\n📂 Reading relevant files…", { parse_mode: "MarkdownV2" });
 
+  let executor: ToolExecutor | undefined;
   try {
-    const config = defaultAgentConfig();
     const tracker = new ActionTracker();
-    const executor = new ToolExecutor(tracker, config);
+    executor = new ToolExecutor(tracker, config);
     const tools = createAgentTools(executor);
     const agent = new ToolLoopAgent({
       ...agentOptions(config, 40),
       tools,
     });
 
-    const { text } = await agent.generate({ prompt: goal });
+    let step = 0;
+    await ctx.reply("⏳ I’m starting the task. I’ll update you as I inspect and work through the code.");
+    const { text } = await agent.generate({
+      prompt: priorContext ? `Conversation context:\n${priorContext}\n\nCurrent request:\n${goal}` : goal,
+      abortSignal,
+      onStepFinish: async ({ toolCalls }) => {
+        step++;
+        if (step % 2 !== 1 && toolCalls.length === 0) return;
+        const toolsUsed = toolCalls.map((call) => call.toolName).filter(Boolean);
+        const detail = toolsUsed.length ? `Used: ${toolsUsed.join(", ")}` : "Thinking through the next part";
+        try {
+          await ctx.reply(`🔄 Agent progress (${step}): ${detail}.`);
+        } catch (error) {
+          console.error("Unable to send Telegram progress update:", error);
+        }
+      },
+    });
 
     memoryManager.addMessage(sessionId, 'assistant', text || 'no answer');
 
@@ -409,8 +431,12 @@ export async function runAgent(ctx: { reply: (t: string, o?: object) => Promise<
     }
     await finishOrApprove(ctx, chatId, tracker, executor, "✅ *Done.* No file changes were needed.");
   } catch (err) {
-    await partialDone(ctx, "Agent", err instanceof Error ? err.message : String(err));
-    throw err;
+    executor?.clearStaging();
+    if (abortSignal?.aborted) {
+      await ctx.reply("⏹ Task cancelled. No staged changes were applied.");
+      return;
+    }
+    await partialDone(ctx, "Agent", err);
   }
 }
 
@@ -419,35 +445,38 @@ export async function runPlanSteps(
   chatId: number,
   plan: Plan,
   steps: PlanStep[],
+  abortSignal?: AbortSignal,
 ) {
-  // Create session for memory
-  const sessionId = `telegram_plan_${chatId}_${Date.now()}`;
+  const config = defaultAgentConfig();
+  const sessionId = memoryManager.resolveSessionId(`telegram_plan_${chatId}`, config.codebasePath);
+  const priorContext = memoryManager.getRecentContext(sessionId);
   const taskId = memoryManager.createTask(`Plan: ${plan.goal}`);
   memoryManager.addMessage(sessionId, 'user', `Plan: ${plan.goal}\nSteps: ${steps.map(s => s.title).join(', ')}`);
   const startMs = Date.now();
 
   // Clean header
-  await ctx.reply("🗺 *Plan Execution*\n\n📋 *Goal:* " + escapeMarkdown(plan.goal), { parse_mode: "MarkdownV2" });
+  await ctx.reply(`🗺 Plan Execution\n\n📋 Goal: ${plan.goal}`);
 
   // Show steps summary
-  const stepList = steps.map((s, i) => `${i + 1}. *${escapeMarkdown(s.title)}*`).join('\n');
-  await ctx.reply("📝 *Steps:*\n" + stepList, { parse_mode: "MarkdownV2" });
+  const stepList = steps.map((s, i) => `${i + 1}. ${s.title}`).join('\n');
+  await ctx.reply("📝 Steps:\n" + stepList);
 
+  let executor: ToolExecutor | undefined;
   try {
-    const config = defaultAgentConfig();
     const tracker = new ActionTracker();
-    const executor = new ToolExecutor(tracker, config);
+    executor = new ToolExecutor(tracker, config);
     const tools = { ...createAgentTools(executor), ...extraWebTools(tracker) };
 
     for (let idx = 0; idx < steps.length; idx++) {
       const step = steps[idx]!;
-      await ctx.reply(`🔧 *Step ${idx + 1}/${steps.length}:* ${escapeMarkdown(step.title)}`, { parse_mode: "MarkdownV2" });
-      const prompt = [`Goal: ${plan.goal}`, `Step: ${step.title}`, step.description].join('\n');
+      await ctx.reply(`🔧 Step ${idx + 1}/${steps.length}: ${step.title}`);
+      const prompt = [priorContext ? `Conversation context:\n${priorContext}` : "", `Goal: ${plan.goal}`, `Step: ${step.title}`, step.description].filter(Boolean).join('\n\n');
       const agent = new ToolLoopAgent({
         ...agentOptions(config, 30),
         tools,
       });
-      const { text } = await agent.generate({ prompt });
+      const { text } = await agent.generate({ prompt, abortSignal });
+      memoryManager.addMessage(sessionId, 'assistant', text || `Completed step: ${step.title}`);
       if (text?.trim()) await replyMarkdown(ctx, text.trim());
     }
 
@@ -462,8 +491,12 @@ export async function runPlanSteps(
     });
     await finishOrApprove(ctx, chatId, tracker, executor, "✅ *All steps completed successfully!*");
   } catch (err) {
-    await partialDone(ctx, "Plan", err instanceof Error ? err.message : String(err));
-    throw err;
+    executor?.clearStaging();
+    if (abortSignal?.aborted) {
+      await ctx.reply("⏹ Plan execution cancelled. No staged changes were applied.");
+      return;
+    }
+    await partialDone(ctx, "Plan", err);
   }
 }
 

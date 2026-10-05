@@ -2,6 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
+const DEFAULT_CONTEXT_TOKENS = 1_500;
+const MAX_CONVERSATION_SESSIONS = 50;
+const MAX_TASKS_IN_MEMORY = 200;
+
+function contextTokenLimit(): number {
+  const configured = Number.parseInt(process.env.RIFECLAW_MEMORY_CONTEXT_TOKENS ?? "", 10);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_CONTEXT_TOKENS;
+  return Math.min(configured, 12_000);
+}
+
 export interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -37,24 +47,10 @@ export class MemoryManager {
   }
 
   /**
-   * Returns the most recent non-expired session ID that starts with the given prefix.
-   * Falls back to creating a fresh one via projectSessionId.
+   * Returns the stable session for exactly this mode and project. Never choose
+   * another project's session just because its ID shares the same mode prefix.
    */
   resolveSessionId(mode: string, codebasePath?: string): string {
-    const prefix = `${mode}_`;
-    const candidates = [...this.conversationHistory.keys()].filter(
-      (id) => id.startsWith(prefix)
-    );
-    if (candidates.length > 0) {
-      // Return the one with the most recent message
-      return candidates.reduce((latest, id) => {
-        const msgs = this.conversationHistory.get(id) ?? [];
-        const latestMsgs = this.conversationHistory.get(latest) ?? [];
-        const last = msgs[msgs.length - 1]?.timestamp ?? 0;
-        const latestLast = latestMsgs[latestMsgs.length - 1]?.timestamp ?? 0;
-        return last > latestLast ? id : latest;
-      });
-    }
     return this.projectSessionId(mode, codebasePath);
   }
 
@@ -76,6 +72,7 @@ export class MemoryManager {
     if (messages.length > 100) {
       messages.shift();
     }
+    this.pruneConversationSessions(sessionId);
   }
 
   getMessages(sessionId: string, count = 10): Message[] {
@@ -83,7 +80,7 @@ export class MemoryManager {
     return messages.slice(-count * 2); // Each turn = user + assistant
   }
 
-  getRecentContext(sessionId: string, maxTokens = 8000): string {
+  getRecentContext(sessionId: string, maxTokens = contextTokenLimit()): string {
     const messages = this.getMessages(sessionId, 50);
     let totalLength = 0;
     const selected: Message[] = [];
@@ -118,8 +115,31 @@ export class MemoryManager {
       createdAt: now,
       lastUpdated: now
     });
+    this.pruneOldTasks();
 
     return id;
+  }
+
+  private pruneConversationSessions(currentSessionId: string): void {
+    if (this.conversationHistory.size <= MAX_CONVERSATION_SESSIONS) return;
+    const oldestSessions = [...this.conversationHistory.entries()]
+      .filter(([id]) => id !== currentSessionId)
+      .sort(([, a], [, b]) => (a[a.length - 1]?.timestamp ?? 0) - (b[b.length - 1]?.timestamp ?? 0));
+    while (this.conversationHistory.size > MAX_CONVERSATION_SESSIONS && oldestSessions.length) {
+      const oldest = oldestSessions.shift();
+      if (oldest) this.conversationHistory.delete(oldest[0]);
+    }
+  }
+
+  private pruneOldTasks(): void {
+    if (this.taskMemory.size <= MAX_TASKS_IN_MEMORY) return;
+    const completed = [...this.taskMemory.values()]
+      .filter((task) => task.status === "completed" || task.status === "failed")
+      .sort((a, b) => a.lastUpdated.getTime() - b.lastUpdated.getTime());
+    while (this.taskMemory.size > MAX_TASKS_IN_MEMORY && completed.length) {
+      const oldest = completed.shift();
+      if (oldest) this.taskMemory.delete(oldest.id);
+    }
   }
 
   updateTask(id: string, updates: Partial<TaskSnapshot>): void {

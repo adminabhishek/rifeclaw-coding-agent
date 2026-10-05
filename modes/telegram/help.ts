@@ -1,11 +1,12 @@
 /**
  * Help / onboarding message builder for the Telegram bot.
  *
- * Uses Telegram's MarkdownV2 (bot API v7+). All raw text is pre-escaped
- * via the local md2() helper so it renders correctly in any client.
+ * Uses Telegram's MarkdownV2 (bot API v7+). Plain text is escaped while
+ * formatting is added with helpers that preserve active Markdown delimiters.
  */
 
 import { optionalEnv } from "../../env.ts";
+import { Markup } from "telegraf";
 
 // Hardcoded version — update manually when releasing. Avoids path-fragility
 // of import.meta.url in bundled/published packages.
@@ -22,25 +23,19 @@ const MODEL = (() => {
 // ── MarkdownV2 escape ───────────────────────────────────────────────────────
 // Characters that MUST be escaped in MarkdownV2 outside of code spans:
 //   _ * [ ] ( ) ~ ` > # + - = | { } . !
-// We temporarily protect inline backtick code spans, escape everything else,
-// then restore the code spans.
-
+// Escape plain text only. Formatting is added separately so its delimiters
+// remain active MarkdownV2 instead of appearing literally in Telegram.
 function md2(text: string): string {
-  const codeSpans: string[] = [];
-  let result = text.replace(/`[^`\n]+`/g, (m) => {
-    codeSpans.push(m);
-    return `\x00${codeSpans.length - 1}\x00`;
-  });
-  // Escape all MarkdownV2 special chars.
-  // Per Telegram docs: _ * [ ] ( ) ~ ` > # + - = | { } . !
-  result = result.replace(/[_*[\]()~`>#+\-=|{}.!]/g, (c) => `\\${c}`);
-  result = result.replace(/\x00(\d+)\x00/g, (_, i) => {
-    const span = codeSpans[Number(i)] ?? "";
-    // Escape dots and parentheses inside code spans too — Telegram's parser
-    // is stricter than the spec and requires them escaped everywhere.
-    return span.replace(/[().]/g, (c) => `\\${c}`);
-  });
-  return result;
+  const special = new Set("\\_*[]()~`>#+-=|{}.!".split(""));
+  return [...text].map((c) => special.has(c) ? `\\${c}` : c).join("");
+}
+
+function bold(text: string): string {
+  return `*${md2(text)}*`;
+}
+
+function code(text: string): string {
+  return `\`${text.replace(/[\\`]/g, (c) => `\\${c}`)}\``;
 }
 
 interface CommandEntry {
@@ -94,42 +89,42 @@ export function buildHelpMessage(): string {
 
   sections.push(
     [
-      md2("*🤖 RifeClaw — Telegram Bot*"),
-      md2("*AI coding assistant for your local project*"),
-      md2(`*v${VERSION}*  •  Model: \`${MODEL}\``),
+      bold("🤖 RifeClaw — Telegram Bot"),
+      bold("AI coding assistant for your local project"),
+      `${bold(`v${VERSION}`)}  •  Model: ${code(MODEL)}`,
     ].join("\n"),
   );
 
   sections.push(
     [
       DIVIDER,
-      md2("*📚 Commands*"),
-      ...COMMANDS.map((c) => md2(`${c.icon}  *${c.command}* — ${c.description}`)),
+      bold("📚 Commands"),
+      ...COMMANDS.map((c) => `${c.icon}  ${bold(c.command)} — ${md2(c.description)}`),
     ].join("\n"),
   );
 
   sections.push(
     [
       DIVIDER,
-      md2("*💡 Examples*"),
+      bold("💡 Examples"),
       ...COMMANDS
         .filter((c) => c.example !== c.command)
-        .map((c) => md2(`• \`${c.example}\``)),
+        .map((c) => `• ${code(c.example)}`),
     ].join("\n"),
   );
 
   sections.push(
     [
       DIVIDER,
-      md2("*❓ FAQ*"),
-      md2("• *Are my files safe?* — Yes. Agent and Plan mode *stage* every change. Nothing is written until you click ✅."),
-      md2("• *Can I undo?* — During a plan you can reject any step. After applying, use `git` to revert."),
-      md2("• *What model is this?* — Configurable in your `.env` (OpenRouter or local Ollama)."),
-      md2("• *Is this private?* — Only you can talk to this bot. Auth is enforced on every command."),
+      bold("❓ FAQ"),
+      `• ${bold("Are my files safe?")} — Yes. Agent and Plan mode ${bold("stage")} every change. Nothing is written until you click ✅\.`,
+      `• ${bold("Can I undo?")} — During a plan you can reject any step. After applying, use ${code("git")} to revert\.`,
+      `• ${bold("What model is this?")} — Configurable in your ${code(".env")} (OpenRouter or local Ollama)\.`,
+      `• ${bold("Is this private?")} — Only you can talk to this bot. Auth is enforced on every command\.`,
     ].join("\n"),
   );
 
-  sections.push([DIVIDER, md2("*Type any command above to get started.*")].join("\n"));
+  sections.push([DIVIDER, bold("Type any command above to get started.")].join("\n"));
 
   return sections.join("\n\n");
 }
@@ -139,16 +134,13 @@ export function buildHelpMessage(): string {
  */
 export function buildWelcomeMessage(): string {
   return [
-    md2("*👋 Welcome to RifeClaw!*"),
+    bold("👋 Welcome to RifeClaw!"),
     "",
-    md2("*I help you navigate and modify your codebase from Telegram.*"),
+    bold("I help you navigate and modify your codebase from Telegram."),
     "",
-    md2("*Quick start:*"),
-    md2("1) Try /ask for a read-only question first."),
-    md2("2) Use /plan to break larger work into steps."),
-    md2("3) Use /agent when you want me to make changes (with your approval)."),
+    md2("Choose Ask, Plan, or Agent from the buttons below, then send your request."),
     "",
-    md2("*Run /help any time to see all commands and examples.*"),
+    md2("Changes are always shown for your approval before they are applied."),
   ].join("\n");
 }
 
@@ -157,9 +149,16 @@ export function buildWelcomeMessage(): string {
  */
 export function buildUnauthorizedMessage(): string {
   return [
-    md2("*🔒 Access Denied*"),
+    bold("🔒 Access Denied"),
     "",
     md2("Only the bot owner can use this bot."),
-    md2("If this is your bot, set `TELEGRAM_OWNER_ID` in your `.env` to your Telegram numeric user ID."),
+    `If this is your bot, set ${code("TELEGRAM_OWNER_ID")} in your ${code(".env")} to your Telegram numeric user ID\.`,
   ].join("\n");
+}
+
+export function welcomeKeyboard() {
+  return Markup.keyboard([
+    ["🔎 Ask", "🧭 Plan"],
+    ["🤖 Agent", "📚 Help"],
+  ]).resize().persistent();
 }

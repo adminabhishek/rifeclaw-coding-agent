@@ -2,7 +2,19 @@ import { tool } from "ai";
 import { z } from "zod";
 import type { ToolExecutor } from "./tool-executor";
 
-export function createAgentTools(executor: ToolExecutor) {
+export interface AgentToolObserver {
+  onToolStart?: (name: string, input: unknown) => void;
+  onToolFinish?: (name: string, result: unknown) => void;
+}
+
+export function createAgentTools(executor: ToolExecutor, observer: AgentToolObserver = {}) {
+  const runTool = (name: string, input: unknown, operation: () => unknown) => {
+    observer.onToolStart?.(name, input);
+    const result = operation();
+    observer.onToolFinish?.(name, result);
+    return result;
+  };
+
   return {
     read_file: tool({
       description:
@@ -10,7 +22,14 @@ export function createAgentTools(executor: ToolExecutor) {
       inputSchema: z.object({
         path: z.string().describe("Relative file path"),
       }),
-      execute: async ({ path: p }) => executor.readFile(p),
+      execute: async ({ path: p }) => runTool("read_file", { path: p }, () => executor.readFile(p)),
+    }),
+
+    read_files: tool({
+      description:
+        "Read up to 8 relevant workspace files in one call after locating them. Prefer this over several read_file calls when the paths are already known.",
+      inputSchema: z.object({ paths: z.array(z.string()).min(1).max(8) }),
+      execute: async ({ paths }) => runTool("read_files", { paths }, () => executor.readFiles(paths)),
     }),
 
     create_file: tool({
@@ -20,7 +39,7 @@ export function createAgentTools(executor: ToolExecutor) {
         path: z.string(),
         content: z.string(),
       }),
-      execute: async ({ path: p, content }) => executor.createFile(p, content),
+      execute: async ({ path: p, content }) => runTool("create_file", { path: p }, () => executor.createFile(p, content)),
     }),
 
     modify_file: tool({
@@ -30,7 +49,7 @@ export function createAgentTools(executor: ToolExecutor) {
         path: z.string(),
         content: z.string().describe("Complete new file contents"),
       }),
-      execute: async ({ path: p, content }) => executor.modifyFile(p, content),
+      execute: async ({ path: p, content }) => runTool("modify_file", { path: p }, () => executor.modifyFile(p, content)),
     }),
 
     delete_file: tool({
@@ -38,7 +57,7 @@ export function createAgentTools(executor: ToolExecutor) {
       inputSchema: z.object({
         path: z.string(),
       }),
-      execute: async ({ path: p }) => executor.deleteFile(p),
+      execute: async ({ path: p }) => runTool("delete_file", { path: p }, () => executor.deleteFile(p)),
     }),
 
     create_folder: tool({
@@ -47,7 +66,7 @@ export function createAgentTools(executor: ToolExecutor) {
       inputSchema: z.object({
         path: z.string().describe("Relative directory path"),
       }),
-      execute: async ({ path: p }) => executor.createFolder(p),
+      execute: async ({ path: p }) => runTool("create_folder", { path: p }, () => executor.createFolder(p)),
     }),
 
     list_files: tool({
@@ -57,7 +76,7 @@ export function createAgentTools(executor: ToolExecutor) {
         recursive: z.boolean().optional().default(false),
       }),
       execute: async ({ path: p, recursive }) =>
-        executor.listFiles(p, recursive),
+        runTool("list_files", { path: p, recursive }, () => executor.listFiles(p, recursive)),
     }),
 
     search_files: tool({
@@ -71,7 +90,7 @@ export function createAgentTools(executor: ToolExecutor) {
         content_contains: z.string().optional(),
       }),
       execute: async ({ root, pattern, content_contains }) =>
-        executor.searchFiles(root, pattern, content_contains),
+        runTool("search_files", { root, pattern, content_contains }, () => executor.searchFiles(root, pattern, content_contains)),
     }),
 
     analyze_codebase: tool({
@@ -80,7 +99,7 @@ export function createAgentTools(executor: ToolExecutor) {
       inputSchema: z.object({
         path: z.string().default("."),
       }),
-      execute: async ({ path: p }) => executor.analyzeCodebase(p),
+      execute: async ({ path: p }) => runTool("analyze_codebase", { path: p }, () => executor.analyzeCodebase(p)),
     }),
 
     execute_shell: tool({
@@ -89,14 +108,14 @@ export function createAgentTools(executor: ToolExecutor) {
       inputSchema: z.object({
         command: z.string().describe("Single command; runs with shell: true"),
       }),
-      execute: async ({ command }) => executor.queueShell(command),
+      execute: async ({ command }) => runTool("execute_shell", { command }, () => executor.queueShell(command)),
     }),
 
     list_skills: tool({
       description:
         "List absolute paths to SKILL.md files under configured skill directories (Cursor / Claude).",
       inputSchema: z.object({}),
-      execute: async () => executor.listSkills(),
+      execute: async () => runTool("list_skills", {}, () => executor.listSkills()),
     }),
 
     read_skill: tool({
@@ -105,7 +124,7 @@ export function createAgentTools(executor: ToolExecutor) {
       inputSchema: z.object({
         path: z.string(),
       }),
-      execute: async ({ path: p }) => executor.readSkill(p),
+      execute: async ({ path: p }) => runTool("read_skill", { path: p }, () => executor.readSkill(p)),
     }),
   };
 }

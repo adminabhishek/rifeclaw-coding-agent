@@ -2,7 +2,8 @@
 
 // MarkdownV2 escape helper (inline to avoid circular deps)
 function escapeMd2(text: string): string {
-  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, (c) => `\\${c}`);
+  const special = new Set("\\_*[]()~`>#+-=|{}.!".split(""));
+  return [...text].map((char) => special.has(char) ? `\\${char}` : char).join("");
 }
 
 interface TelegramErrorOptions {
