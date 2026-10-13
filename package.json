@@ -1,6 +1,6 @@
 {
   "name": "rifeclaw",
-  "version": "0.1.6",
+  "version": "2.0.0",
   "description": "AI coding assistant for working with a local project from CLI or Telegram.",
   "module": "dist/index.js",
   "main": "dist/index.js",
